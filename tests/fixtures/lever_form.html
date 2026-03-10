@@ -1,0 +1,35 @@
+<html>
+  <body>
+    <form>
+      <label for="firstName">First Name</label>
+      <input id="firstName" name="firstName" type="text" autocomplete="given-name" required />
+
+      <label for="lastName">Last Name</label>
+      <input id="lastName" name="lastName" type="text" autocomplete="family-name" required />
+
+      <label for="email">Email</label>
+      <input id="email" name="email" type="text" autocomplete="email" required />
+
+      <label for="phone">Phone</label>
+      <input id="phone" name="phone" type="tel" />
+
+      <label for="resume">Resume</label>
+      <input id="resume" name="resume" type="file" />
+
+      <label for="urlsLinkedIn">LinkedIn Profile</label>
+      <input id="urlsLinkedIn" name="urls[LinkedIn]" type="text" />
+
+      <label for="question_notice">When can you start?</label>
+      <select id="question_notice" required>
+        <option value="">Select an answer</option>
+        <option value="Immediately">Immediately</option>
+        <option value="In 1 month">In 1 month</option>
+      </select>
+
+      <label for="question_why_role">Why this role?</label>
+      <textarea id="question_why_role" required></textarea>
+
+      <button type="submit">Submit application</button>
+    </form>
+  </body>
+</html>

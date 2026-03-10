@@ -1,0 +1,35 @@
+<html>
+  <body>
+    <form>
+      <label for="first_name">First Name</label>
+      <input id="first_name" type="text" name="first_name" autocomplete="given-name" required />
+
+      <label for="last_name">Last Name</label>
+      <input id="last_name" type="text" name="last_name" autocomplete="family-name" required />
+
+      <label for="email">Email</label>
+      <input id="email" type="text" name="candidate_email" autocomplete="email" required />
+
+      <label for="phone">Phone</label>
+      <input id="phone" type="tel" name="phone" />
+
+      <label for="resume">Resume</label>
+      <input id="resume" type="file" name="resume" required />
+
+      <label for="question_100">LinkedIn Profile</label>
+      <input id="question_100" type="text" aria-label="LinkedIn Profile" />
+
+      <label for="question_work_auth">Are you legally authorized to work in the UK?</label>
+      <select id="question_work_auth" required>
+        <option value="">Select an answer</option>
+        <option value="Yes">Yes</option>
+        <option value="No">No</option>
+      </select>
+
+      <label for="question_why_anthropic">Why Anthropic?</label>
+      <textarea id="question_why_anthropic" required></textarea>
+
+      <button type="submit">Submit application</button>
+    </form>
+  </body>
+</html>

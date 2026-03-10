@@ -1,0 +1,247 @@
+from __future__ import annotations
+
+import logging
+
+import httpx
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from apps.api.app.db import get_session
+from apps.api.app.models import ApplicationDraft, JobLead
+from apps.api.app.schemas import (
+    ApplicationDraftResponse,
+    JobDiscoveryRequest,
+    JobLeadResponse,
+    LinkedinLeadRequest,
+    ResearchResponse,
+)
+from apps.api.app.services.company_research import research_company
+from apps.api.app.services.drafting import build_application_draft
+from apps.api.app.services.job_sources.greenhouse import fetch_greenhouse_jobs
+from apps.api.app.services.job_sources.lever import fetch_lever_jobs
+from apps.api.app.services.job_sources.linkedin import create_linkedin_lead
+from apps.api.app.services.matching import rank_job
+from apps.api.app.services.storage import (
+    get_latest_profile,
+    get_profile_payload,
+    list_jobs,
+    upsert_job_lead,
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+@router.get("", response_model=list[JobLeadResponse])
+def read_jobs(session: Session = Depends(get_session)) -> list[JobLeadResponse]:
+    return list_jobs(session)
+
+
+@router.post("/discover/greenhouse", response_model=list[JobLeadResponse])
+def discover_greenhouse_jobs(
+    payload: JobDiscoveryRequest,
+    session: Session = Depends(get_session),
+) -> list[JobLeadResponse]:
+    discovered: list[JobLead] = []
+    failures: list[tuple[int, str]] = []
+    for board_token in payload.identifiers:
+        try:
+            jobs = fetch_greenhouse_jobs(
+                board_token, include_questions=payload.include_questions
+            )
+        except Exception as exc:
+            failures.append(_map_discovery_error("greenhouse", board_token, exc))
+            continue
+
+        for job_payload in jobs:
+            discovered.append(_save_and_score_job(session, job_payload))
+
+    _raise_if_discovery_failed(failures, discovered)
+    return discovered
+
+
+@router.post("/discover/lever", response_model=list[JobLeadResponse])
+def discover_lever_jobs(
+    payload: JobDiscoveryRequest,
+    session: Session = Depends(get_session),
+) -> list[JobLeadResponse]:
+    discovered: list[JobLead] = []
+    failures: list[tuple[int, str]] = []
+    for slug in payload.identifiers:
+        try:
+            jobs = fetch_lever_jobs(slug)
+        except Exception as exc:
+            failures.append(_map_discovery_error("lever", slug, exc))
+            continue
+
+        for job_payload in jobs:
+            discovered.append(_save_and_score_job(session, job_payload))
+
+    _raise_if_discovery_failed(failures, discovered)
+    return discovered
+
+
+@router.post("/discover/linkedin", response_model=JobLeadResponse)
+def discover_linkedin_job(
+    payload: LinkedinLeadRequest,
+    session: Session = Depends(get_session),
+) -> JobLeadResponse:
+    job = _save_and_score_job(session, create_linkedin_lead(payload))
+    return job
+
+
+@router.post("/{job_id}/research", response_model=ResearchResponse)
+def run_company_research(job_id: int, session: Session = Depends(get_session)) -> ResearchResponse:
+    job = _get_job(session, job_id)
+    research = research_company(job.company, job.url)
+    job.research = research
+    session.commit()
+    session.refresh(job)
+    return ResearchResponse(**research)
+
+
+@router.post("/{job_id}/draft", response_model=ApplicationDraftResponse)
+def draft_application(
+    job_id: int, session: Session = Depends(get_session)
+) -> ApplicationDraftResponse:
+    job = _get_job(session, job_id)
+    profile = get_latest_profile(session)
+    profile_payload = get_profile_payload(profile)
+    if profile is None or profile_payload is None:
+        raise HTTPException(status_code=400, detail="Upload a CV before drafting applications.")
+
+    ranking = rank_job(profile_payload, job_to_payload(job))
+    job.score = ranking.score
+    job.score_details = ranking.model_dump(mode="json")
+    if not job.research:
+        job.research = research_company(job.company, job.url)
+
+    draft_payload = build_application_draft(
+        profile_payload,
+        job_to_payload(job),
+        ranking,
+        job.research,
+    )
+    draft = ApplicationDraft(
+        profile_id=profile.id,
+        job_lead_id=job.id,
+        tailored_summary=draft_payload["tailored_summary"],
+        cover_note=draft_payload["cover_note"],
+        resume_bullets=draft_payload["resume_bullets"],
+        screening_answers=draft_payload["screening_answers"],
+    )
+    session.add(draft)
+    session.commit()
+    session.refresh(draft)
+    return draft
+
+
+def _save_and_score_job(session: Session, payload: dict) -> JobLead:
+    profile = get_latest_profile(session)
+    profile_payload = get_profile_payload(profile)
+    job = upsert_job_lead(session, payload)
+    if profile_payload:
+        ranking = rank_job(profile_payload, payload)
+        job.score = ranking.score
+        job.score_details = ranking.model_dump(mode="json")
+        session.commit()
+        session.refresh(job)
+    return job
+
+
+def _get_job(session: Session, job_id: int) -> JobLead:
+    job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job lead not found.")
+    return job
+
+
+def job_to_payload(job: JobLead) -> dict:
+    return {
+        "source": job.source,
+        "external_id": job.external_id,
+        "company": job.company,
+        "title": job.title,
+        "location": job.location,
+        "employment_type": job.employment_type,
+        "url": job.url,
+        "description": job.description,
+        "requirements": job.requirements,
+        "metadata_json": job.metadata_json,
+    }
+
+
+def _map_discovery_error(
+    source: str, identifier: str, exc: Exception
+) -> tuple[int, str]:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status_code = exc.response.status_code
+        if status_code == 404:
+            if source == "greenhouse":
+                return (
+                    400,
+                    f"Greenhouse board token '{identifier}' was not found. "
+                    "Use the public board token from the company's Greenhouse URL.",
+                )
+            return (
+                400,
+                f"Lever company slug '{identifier}' was not found. "
+                "Use the slug from jobs.lever.co/<company-slug>.",
+            )
+        if status_code == 429:
+            return (
+                503,
+                f"{source.title()} is rate limiting requests for '{identifier}'. "
+                "Try again shortly.",
+            )
+        if 500 <= status_code < 600:
+            return (
+                502,
+                f"{source.title()} returned {status_code} while loading '{identifier}'.",
+            )
+        return (
+            502,
+            f"{source.title()} returned {status_code} for '{identifier}'.",
+        )
+
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            504,
+            f"{source.title()} timed out while loading '{identifier}'. Try again in a moment.",
+        )
+
+    if isinstance(exc, httpx.RequestError):
+        return (
+            502,
+            f"Could not reach {source.title()} while loading '{identifier}'.",
+        )
+
+    logger.exception(
+        "Unexpected %s discovery error for identifier %s",
+        source,
+        identifier,
+        exc_info=exc,
+    )
+    return (
+        500,
+        f"Unexpected {source.title()} discovery error for '{identifier}'.",
+    )
+
+
+def _raise_if_discovery_failed(
+    failures: list[tuple[int, str]], discovered: list[JobLead]
+) -> None:
+    if not failures:
+        return
+
+    if discovered:
+        logger.warning(
+            "Discovery completed with partial failures: %s",
+            "; ".join(message for _status, message in failures),
+        )
+        return
+
+    status_code = max(status for status, _message in failures)
+    detail = "; ".join(message for _status, message in failures)
+    raise HTTPException(status_code=status_code, detail=detail)
