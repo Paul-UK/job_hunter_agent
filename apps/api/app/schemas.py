@@ -161,6 +161,7 @@ class WorkerFieldOption(BaseModel):
     label: str
     value: str
     selector: str | None = None
+    selector_candidates: list[str] = Field(default_factory=list)
 
 
 class WorkerActionPayload(BaseModel):
@@ -169,6 +170,9 @@ class WorkerActionPayload(BaseModel):
     value: str
     field_id: str | None = None
     mode: str = "fill"
+    option_label: str | None = None
+    option_selector: str | None = None
+    option_selector_candidates: list[str] = Field(default_factory=list)
 
 
 class WorkerAnswerOverride(BaseModel):
@@ -200,6 +204,7 @@ class WorkerFieldState(BaseModel):
     label: str = ""
     question_text: str = ""
     selector: str
+    selector_candidates: list[str] = Field(default_factory=list)
     field_type: str
     input_type: str | None = None
     html_name: str | None = None

@@ -1,8 +1,17 @@
-import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from 'react'
+import {
+  type CSSProperties,
+  type Dispatch,
+  type SetStateAction,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 import './App.css'
-import jobHunterLogo from './assets/PTxagentic_job_hunter_logo.png'
 import {
   assistApplicationDraft,
+  buildApiUrl,
   bulkDeleteJobLeads,
   captureLinkedinLead,
   createDraft,
@@ -34,6 +43,20 @@ type DraftEditorState = {
   cover_note: string
   screening_answers: ScreeningAnswerPayload[]
 }
+type ToastTone = 'info' | 'success' | 'warning' | 'error'
+type StatusUpdateOptions = {
+  tone?: ToastTone
+  toast?: boolean
+  durationMs?: number
+}
+type ActionFeedback = StatusUpdateOptions & {
+  message: string
+}
+type ToastNotification = {
+  id: number
+  message: string
+  tone: ToastTone
+}
 
 const emptyProfile: CandidateProfilePayload = {
   full_name: '',
@@ -48,7 +71,10 @@ const emptyProfile: CandidateProfilePayload = {
   education: [],
   links: {},
 }
-const fitScoreOptions = [0, 40, 50, 60, 70, 80]
+const DEFAULT_MIN_VISIBLE_SCORE = 1
+const fitScoreOptions = [DEFAULT_MIN_VISIBLE_SCORE, 0, 40, 50, 60, 70, 80]
+const jobHunterLogo = '/assets/icons/pt-job-hunting-logo.png'
+const aiImprovementIcon = '/assets/icons/ai-improvement.jpg'
 
 function App() {
   const [dashboard, setDashboard] = useState<DashboardResponse | null>(null)
@@ -74,15 +100,108 @@ function App() {
   const [pendingDraftJumpId, setPendingDraftJumpId] = useState<number | null>(null)
   const [highlightedDraftId, setHighlightedDraftId] = useState<number | null>(null)
   const [expandedJobIds, setExpandedJobIds] = useState<Record<number, boolean>>({})
+  const [toasts, setToasts] = useState<ToastNotification[]>([])
+  const [isShortlistCollapsed, setIsShortlistCollapsed] = useState(false)
+  const [showAppliedJobs, setShowAppliedJobs] = useState(false)
   const [shortlistFilters, setShortlistFilters] = useState<{
     minScore: number
     location: string
     workplace: WorkplaceFilterValue
   }>({
-    minScore: 0,
+    minScore: DEFAULT_MIN_VISIBLE_SCORE,
     location: '',
     workplace: 'all',
   })
+  const toastTimeoutsRef = useRef<Record<number, number>>({})
+
+  const scrollToElement = useCallback((element: HTMLElement | null, focusSelector?: string) => {
+    if (!element) {
+      return false
+    }
+    element.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    if (focusSelector) {
+      window.setTimeout(() => {
+        const focusTarget = element.querySelector(focusSelector) as HTMLElement | null
+        focusTarget?.focus()
+      }, 220)
+    }
+    return true
+  }, [])
+
+  const jumpToSection = useCallback((sectionId: string) => {
+    return scrollToElement(document.getElementById(sectionId))
+  }, [scrollToElement])
+
+  const jumpToDraft = useCallback((applicationId: number) => {
+    const draftElement = document.getElementById(`application-draft-${applicationId}`)
+    if (!draftElement) {
+      return false
+    }
+    setHighlightedDraftId(applicationId)
+    return scrollToElement(draftElement, 'textarea, input')
+  }, [scrollToElement])
+
+  const jumpToJob = useCallback((jobId: number) => {
+    setIsShortlistCollapsed(false)
+    setExpandedJobIds((current) => (current[jobId] ? current : { ...current, [jobId]: true }))
+    window.setTimeout(() => {
+      void scrollToElement(
+        document.getElementById(`job-lead-${jobId}`) ?? document.getElementById('shortlist-section'),
+      )
+    }, 160)
+  }, [scrollToElement])
+
+  const dismissToast = useCallback((toastId: number) => {
+    const timeoutId = toastTimeoutsRef.current[toastId]
+    if (timeoutId) {
+      window.clearTimeout(timeoutId)
+      delete toastTimeoutsRef.current[toastId]
+    }
+    setToasts((current) => current.filter((toast) => toast.id !== toastId))
+  }, [])
+
+  const pushToast = useCallback(
+    (message: string, tone: ToastTone, options?: Pick<StatusUpdateOptions, 'durationMs'>) => {
+      const nextMessage = message.trim()
+      if (!nextMessage) {
+        return
+      }
+
+      const toastId = Date.now() + Math.round(Math.random() * 1000)
+      setToasts((current) => [...current, { id: toastId, message: nextMessage, tone }].slice(-4))
+
+      const durationMs =
+        options?.durationMs ?? (tone === 'error' ? 8000 : tone === 'warning' ? 6500 : 4200)
+      if (durationMs > 0) {
+        toastTimeoutsRef.current[toastId] = window.setTimeout(() => {
+          dismissToast(toastId)
+        }, durationMs)
+      }
+    },
+    [dismissToast],
+  )
+
+  const updateStatus = useCallback(
+    (message: string, options: StatusUpdateOptions = {}) => {
+      const tone = options.tone ?? 'info'
+      setStatusMessage(message)
+
+      const shouldToast = options.toast ?? (tone === 'error' || tone === 'warning')
+      if (shouldToast) {
+        pushToast(message, tone, { durationMs: options.durationMs })
+      }
+    },
+    [pushToast],
+  )
+
+  useEffect(() => {
+    return () => {
+      for (const timeoutId of Object.values(toastTimeoutsRef.current)) {
+        window.clearTimeout(timeoutId)
+      }
+      toastTimeoutsRef.current = {}
+    }
+  }, [])
 
   useEffect(() => {
     void refreshDashboard()
@@ -159,22 +278,11 @@ function App() {
       return
     }
 
-    const draftElement = document.getElementById(`application-draft-${pendingDraftJumpId}`)
-    if (!draftElement) {
+    if (!jumpToDraft(pendingDraftJumpId)) {
       return
     }
-
-    draftElement.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    window.setTimeout(() => {
-      const firstEditor = draftElement.querySelector('textarea, input') as
-        | HTMLTextAreaElement
-        | HTMLInputElement
-        | null
-      firstEditor?.focus()
-    }, 220)
-    setHighlightedDraftId(pendingDraftJumpId)
     setPendingDraftJumpId(null)
-  }, [pendingDraftJumpId, dashboard?.applications])
+  }, [pendingDraftJumpId, dashboard?.applications, jumpToDraft])
 
   useEffect(() => {
     if (!highlightedDraftId) {
@@ -205,7 +313,17 @@ function App() {
     return next
   }, [dashboard?.worker_runs])
 
-  const shortlist = useMemo(() => {
+  const latestApplicationByJobId = useMemo(() => {
+    const next = new Map<number, ApplicationDraftResponse>()
+    for (const application of dashboard?.applications ?? []) {
+      if (!next.has(application.job_lead_id)) {
+        next.set(application.job_lead_id, application)
+      }
+    }
+    return next
+  }, [dashboard?.applications])
+
+  const filteredShortlist = useMemo(() => {
     const normalizedLocationFilter = shortlistFilters.location.trim().toLowerCase()
 
     return rankedJobs.filter((job) => {
@@ -225,29 +343,98 @@ function App() {
     })
   }, [rankedJobs, shortlistFilters])
 
+  const appliedShortlistCount = useMemo(() => {
+    return filteredShortlist.filter((job) =>
+      isRecordedApplicationStatus(getTrackedJobStatus(job, latestApplicationByJobId.get(job.id))),
+    ).length
+  }, [filteredShortlist, latestApplicationByJobId])
+
+  const shortlist = useMemo(() => {
+    return filteredShortlist
+      .filter((job) => {
+        if (showAppliedJobs) {
+          return true
+        }
+        return !isRecordedApplicationStatus(getTrackedJobStatus(job, latestApplicationByJobId.get(job.id)))
+      })
+      .sort((left, right) => {
+        const leftPriority = getShortlistJobPriority(
+          getTrackedJobStatus(left, latestApplicationByJobId.get(left.id)),
+        )
+        const rightPriority = getShortlistJobPriority(
+          getTrackedJobStatus(right, latestApplicationByJobId.get(right.id)),
+        )
+        if (leftPriority !== rightPriority) {
+          return leftPriority - rightPriority
+        }
+        return (right.score ?? 0) - (left.score ?? 0)
+      })
+  }, [filteredShortlist, latestApplicationByJobId, showAppliedJobs])
+
   const hasShortlistFilters =
-    shortlistFilters.minScore > 0 ||
+    shortlistFilters.minScore !== DEFAULT_MIN_VISIBLE_SCORE ||
     shortlistFilters.location.trim().length > 0 ||
     shortlistFilters.workplace !== 'all'
   const canBulkDeleteFilteredJobs = hasShortlistFilters && shortlist.length > 0
+  const submittedApplicationsCount = useMemo(() => {
+    return (dashboard?.applications ?? []).filter((application) => application.status === 'submitted')
+      .length
+  }, [dashboard?.applications])
+  const currentRunDraft = useMemo(() => {
+    const applicationId = lastWorkerRun?.application_draft_id
+    if (!applicationId) {
+      return null
+    }
+    return (dashboard?.applications ?? []).find((application) => application.id === applicationId) ?? null
+  }, [dashboard?.applications, lastWorkerRun?.application_draft_id])
+  const currentRunJob = currentRunDraft ? jobsById.get(currentRunDraft.job_lead_id) ?? null : null
+  const statusNavItems = [
+    {
+      label: 'Profile sources',
+      value: dashboard?.profile_sources.length ?? 0,
+      targetId: 'profile-section',
+    },
+    {
+      label: 'Job leads',
+      value: dashboard?.jobs.length ?? 0,
+      targetId: 'shortlist-section',
+    },
+    {
+      label: 'Drafted applications',
+      value: dashboard?.applications.length ?? 0,
+      targetId: 'application-drafts-section',
+    },
+    {
+      label: 'Applications sent',
+      value: submittedApplicationsCount,
+      targetId: 'worker-run-section',
+    },
+  ]
 
-  async function refreshDashboard(nextMessage = 'Dashboard is up to date.') {
+  async function refreshDashboard(
+    nextMessage = 'Dashboard is up to date.',
+    options: StatusUpdateOptions = {},
+  ) {
     try {
       const nextDashboard = await getDashboard()
       setDashboard(nextDashboard)
-      setStatusMessage(nextMessage)
+      updateStatus(nextMessage, options)
     } catch (error) {
-      setStatusMessage(getErrorMessage(error))
+      updateStatus(getErrorMessage(error), { tone: 'error', toast: true, durationMs: 8000 })
     }
   }
 
-  async function runAction(key: string, action: () => Promise<string | void>) {
+  async function runAction(key: string, action: () => Promise<ActionFeedback | string | void>) {
     try {
       setBusyKey(key)
-      const nextMessage = await action()
-      await refreshDashboard(nextMessage ?? 'Dashboard is up to date.')
+      const result = await action()
+      const feedback: ActionFeedback =
+        typeof result === 'string'
+          ? { message: result }
+          : result ?? { message: 'Dashboard is up to date.' }
+      await refreshDashboard(feedback.message, feedback)
     } catch (error) {
-      setStatusMessage(getErrorMessage(error))
+      updateStatus(getErrorMessage(error), { tone: 'error', toast: true, durationMs: 8000 })
     } finally {
       setBusyKey(null)
     }
@@ -255,7 +442,7 @@ function App() {
 
   async function handleCvUpload() {
     if (!cvFile) {
-      setStatusMessage('Choose a CV file before uploading.')
+      updateStatus('Choose a CV file before uploading.', { tone: 'warning', toast: true })
       return
     }
     await runAction('cv-upload', async () => {
@@ -267,7 +454,10 @@ function App() {
 
   async function handleLinkedinImport() {
     if (!linkedinText.trim() && !linkedinFile) {
-      setStatusMessage('Paste LinkedIn text or attach an exported file first.')
+      updateStatus('Paste LinkedIn text or attach an exported file first.', {
+        tone: 'warning',
+        toast: true,
+      })
       return
     }
     await runAction('linkedin-import', async () => {
@@ -324,7 +514,10 @@ function App() {
 
   async function handleLinkedinLeadCapture() {
     if (!manualLead.company || !manualLead.title) {
-      setStatusMessage('LinkedIn lead capture requires a company and job title.')
+      updateStatus('LinkedIn lead capture requires a company and job title.', {
+        tone: 'warning',
+        toast: true,
+      })
       return
     }
     await runAction('linkedin-lead', async () => {
@@ -353,9 +546,12 @@ function App() {
       setBusyKey(busyLabel)
       const draft = await createDraft(jobId)
       setPendingDraftJumpId(draft.id)
-      await refreshDashboard(`Created an application draft for job ${jobId}. Jumped to the draft editor.`)
+      await refreshDashboard(`Created an application draft for job ${jobId}. Jumped to the draft editor.`, {
+        tone: 'success',
+        toast: true,
+      })
     } catch (error) {
-      setStatusMessage(getErrorMessage(error))
+      updateStatus(getErrorMessage(error), { tone: 'error', toast: true, durationMs: 8000 })
     } finally {
       setBusyKey(null)
     }
@@ -377,11 +573,17 @@ function App() {
 
   async function handleDeleteFilteredJobs() {
     if (!hasShortlistFilters) {
-      setStatusMessage('Apply at least one shortlist filter before using bulk delete.')
+      updateStatus('Apply at least one shortlist filter before using bulk delete.', {
+        tone: 'warning',
+        toast: true,
+      })
       return
     }
     if (shortlist.length === 0) {
-      setStatusMessage('No filtered leads match the current filters.')
+      updateStatus('No filtered leads match the current filters.', {
+        tone: 'warning',
+        toast: true,
+      })
       return
     }
 
@@ -477,9 +679,9 @@ function App() {
         payload.target === 'cover_note'
           ? 'cover note'
           : (payload.question ?? 'question answer').toLowerCase()
-      setStatusMessage(`AI refreshed the ${subject}. ${result.reasoning}`)
+      updateStatus(`AI refreshed the ${subject}. ${result.reasoning}`, { tone: 'success' })
     } catch (error) {
-      setStatusMessage(getErrorMessage(error))
+      updateStatus(getErrorMessage(error), { tone: 'error', toast: true, durationMs: 8000 })
     } finally {
       setBusyKey(null)
     }
@@ -491,11 +693,15 @@ function App() {
   ) {
     const editor = draftEditors[applicationId] ?? createDraftEditorStateFromId(applicationId, dashboard)
     if (!editor) {
-      setStatusMessage(`Draft ${applicationId} is no longer available.`)
+      updateStatus(`Draft ${applicationId} is no longer available.`, {
+        tone: 'warning',
+        toast: true,
+      })
       return
     }
 
     const busyLabel = options.confirmSubmit ? `submit-${applicationId}` : `preview-${applicationId}`
+    let completedRun: WorkerRunResponse | null = null
     await runAction(busyLabel, async () => {
       const result = await runWorker(applicationId, {
         dry_run: options.dryRun,
@@ -504,16 +710,27 @@ function App() {
         screening_answers: editor.screening_answers,
         answer_overrides: buildAnswerOverrides(applicationId, reviewOverrides),
       })
+      completedRun = result
       setLastWorkerRun(result)
       seedReviewOverrides(result, setReviewOverrides)
-      return buildWorkerStatusMessage(result)
+      return {
+        message: buildWorkerStatusMessage(result),
+        tone: getWorkerToastTone(result, options.confirmSubmit),
+        toast: true,
+      }
     })
+    if (completedRun) {
+      jumpToSection('worker-run-section')
+    }
   }
 
   async function handleAssistCoverNote(applicationId: number) {
     const editor = draftEditors[applicationId] ?? createDraftEditorStateFromId(applicationId, dashboard)
     if (!editor) {
-      setStatusMessage(`Draft ${applicationId} is no longer available.`)
+      updateStatus(`Draft ${applicationId} is no longer available.`, {
+        tone: 'warning',
+        toast: true,
+      })
       return
     }
     await requestDraftAssist(`ai-cover-${applicationId}`, applicationId, {
@@ -623,17 +840,40 @@ function App() {
 
   return (
     <main className="app-shell">
+      <div className="toast-stack" aria-live="polite" aria-atomic="true">
+        {toasts.map((toast) => (
+          <div
+            key={toast.id}
+            className={`toast toast-${toast.tone}`}
+            role={toast.tone === 'error' ? 'alert' : 'status'}
+          >
+            <div className="toast-copy">
+              <span className="toast-label">{getToastToneLabel(toast.tone)}</span>
+              <p>{toast.message}</p>
+            </div>
+            <button
+              type="button"
+              className="toast-dismiss"
+              onClick={() => dismissToast(toast.id)}
+              aria-label="Dismiss notification"
+            >
+              Dismiss
+            </button>
+          </div>
+        ))}
+      </div>
+
       <section className="hero">
         <div className="panel hero-panel">
           <div className="brand-lockup">
             <img
               src={jobHunterLogo}
-              alt="PT x Agentic Job Hunter logo"
+              alt="PT x Job Hunting logo"
               className="brand-logo"
             />
             <div className="brand-meta">
-              <p className="eyebrow">PT x AGENTIC</p>
-              <p className="brand-name">Job Hunter</p>
+              <p className="eyebrow">PT x</p>
+              <p className="brand-name">Job Hunting</p>
             </div>
           </div>
           <h1>Serious job search automation with a final approval gate.</h1>
@@ -647,20 +887,20 @@ function App() {
           <div className="status-panel-body">
             <h2>Run Status</h2>
             <p>{statusMessage}</p>
-            <dl>
-              <div>
-                <dt>Profile sources</dt>
-                <dd>{dashboard?.profile_sources.length ?? 0}</dd>
-              </div>
-              <div>
-                <dt>Job leads</dt>
-                <dd>{dashboard?.jobs.length ?? 0}</dd>
-              </div>
-              <div>
-                <dt>Drafted applications</dt>
-                <dd>{dashboard?.applications.length ?? 0}</dd>
-              </div>
-            </dl>
+            <div className="status-nav-grid">
+              {statusNavItems.map((item) => (
+                <button
+                  key={item.label}
+                  type="button"
+                  className="status-nav-item"
+                  onClick={() => jumpToSection(item.targetId)}
+                >
+                  <span className="status-nav-label">{item.label}</span>
+                  <strong className="status-nav-value">{item.value}</strong>
+                  <span className="status-nav-hint">Open section</span>
+                </button>
+              ))}
+            </div>
           </div>
           <div className="status-footnote">
             <span>Local-first</span>
@@ -669,7 +909,7 @@ function App() {
         </aside>
       </section>
 
-      <section className="grid two-column">
+      <section className="grid two-column" id="profile-section">
         <article className="panel">
           <h2>Profile Intake</h2>
           <label className="field">
@@ -915,13 +1155,14 @@ function App() {
         </article>
       </section>
 
-      <section className="panel panel-section">
+      <section className="panel panel-section" id="shortlist-section">
         <div className="panel-header">
           <div className="panel-title-group">
             <p className="panel-kicker">Shortlist</p>
             <h2>Ranked Jobs</h2>
             <p className="panel-subtitle">
-              Fit score combines title alignment, skills, and location compatibility.
+              Fit score combines title alignment, skills, and location compatibility. Applied roles
+              are tracked separately so you can avoid duplicate work.
             </p>
           </div>
           <div className="header-actions">
@@ -930,6 +1171,11 @@ function App() {
                 ? `${shortlist.length} of ${rankedJobs.length} roles`
                 : `${shortlist.length} ${shortlist.length === 1 ? 'role' : 'roles'}`}
             </span>
+            {appliedShortlistCount > 0 ? (
+              <span className="count-badge">
+                {appliedShortlistCount} applied {showAppliedJobs ? 'shown' : 'hidden'}
+              </span>
+            ) : null}
             <button
               className="button-muted"
               onClick={() => void refreshDashboard()}
@@ -937,9 +1183,17 @@ function App() {
             >
               Refresh
             </button>
+            <button
+              type="button"
+              className="button-muted"
+              onClick={() => setIsShortlistCollapsed((current) => !current)}
+            >
+              {isShortlistCollapsed ? 'Expand' : 'Collapse'}
+            </button>
           </div>
         </div>
-        <div className="panel-body">
+        {!isShortlistCollapsed ? (
+          <div className="panel-body">
           <div className="shortlist-toolbar">
             <div className="filter-grid">
               <label className="field field-compact">
@@ -955,7 +1209,11 @@ function App() {
                 >
                   {fitScoreOptions.map((score) => (
                     <option key={score} value={score}>
-                      {score === 0 ? 'Any score' : `${score}+`}
+                      {score === DEFAULT_MIN_VISIBLE_SCORE
+                        ? 'Hide 0 scores'
+                        : score === 0
+                          ? 'Show all scores'
+                          : `${score}+`}
                     </option>
                   ))}
                 </select>
@@ -999,31 +1257,46 @@ function App() {
                 </div>
               </div>
             </div>
-            {hasShortlistFilters ? (
+            {appliedShortlistCount > 0 || hasShortlistFilters ? (
               <div className="shortlist-actions">
-                <button
-                  type="button"
-                  className="button-secondary shortlist-clear"
-                  onClick={() =>
-                    setShortlistFilters({
-                      minScore: 0,
-                      location: '',
-                      workplace: 'all',
-                    })
-                  }
-                >
-                  Clear filters
-                </button>
-                <button
-                  type="button"
-                  className="button-danger shortlist-clear"
-                  onClick={() => void handleDeleteFilteredJobs()}
-                  disabled={!canBulkDeleteFilteredJobs || busyKey === 'delete-filtered-jobs'}
-                >
-                  {busyKey === 'delete-filtered-jobs'
-                    ? 'Deleting...'
-                    : `Delete ${shortlist.length} filtered ${shortlist.length === 1 ? 'lead' : 'leads'}`}
-                </button>
+                {appliedShortlistCount > 0 ? (
+                  <button
+                    type="button"
+                    className="button-secondary shortlist-clear"
+                    onClick={() => setShowAppliedJobs((current) => !current)}
+                  >
+                    {showAppliedJobs
+                      ? `Hide ${appliedShortlistCount} applied`
+                      : `Show ${appliedShortlistCount} applied`}
+                  </button>
+                ) : null}
+                {hasShortlistFilters ? (
+                  <>
+                    <button
+                      type="button"
+                      className="button-secondary shortlist-clear"
+                      onClick={() =>
+                        setShortlistFilters({
+                          minScore: DEFAULT_MIN_VISIBLE_SCORE,
+                          location: '',
+                          workplace: 'all',
+                        })
+                      }
+                    >
+                      Clear filters
+                    </button>
+                    <button
+                      type="button"
+                      className="button-danger shortlist-clear"
+                      onClick={() => void handleDeleteFilteredJobs()}
+                      disabled={!canBulkDeleteFilteredJobs || busyKey === 'delete-filtered-jobs'}
+                    >
+                      {busyKey === 'delete-filtered-jobs'
+                        ? 'Deleting...'
+                        : `Delete ${shortlist.length} filtered ${shortlist.length === 1 ? 'lead' : 'leads'}`}
+                    </button>
+                  </>
+                ) : null}
               </div>
             ) : null}
           </div>
@@ -1031,10 +1304,15 @@ function App() {
             <div className="card-grid card-grid-panel">
               {shortlist.map((job) => {
                 const isExpanded = expandedJobIds[job.id] ?? false
+                const fitScore = Math.round(job.score ?? 0)
+                const linkedApplication = latestApplicationByJobId.get(job.id) ?? null
+                const trackedJobStatus = getTrackedJobStatus(job, linkedApplication)
+                const isAppliedJob = isRecordedApplicationStatus(trackedJobStatus)
                 return (
                   <article
                     key={job.id}
-                    className={`job-card ${isExpanded ? 'job-card-expanded' : 'job-card-collapsed'}`}
+                    id={`job-lead-${job.id}`}
+                    className={`job-card ${isExpanded ? 'job-card-expanded' : 'job-card-collapsed'} ${isAppliedJob ? 'job-card-applied' : trackedJobStatus ? 'job-card-tracked' : ''}`.trim()}
                   >
                     <div className="job-card-header">
                       <div className="job-card-title-block">
@@ -1042,14 +1320,22 @@ function App() {
                         <p className="job-card-company">
                           {job.company} · {formatJobSource(job.source)}
                         </p>
+                        {trackedJobStatus ? (
+                          <div className="job-card-status-row">
+                            <span className={getWorkerStatusBadgeClassName(trackedJobStatus)}>
+                              {formatWorkerStatus(trackedJobStatus)}
+                            </span>
+                          </div>
+                        ) : null}
                       </div>
                       <div
                         className="job-score-card"
-                        aria-label={`Fit score ${Math.round(job.score ?? 0)} out of 100`}
+                        aria-label={`Fit score ${fitScore} out of 100`}
+                        style={getFitScoreCardStyle(fitScore)}
                       >
                         <span className="job-score-label">Fit score</span>
-                        <strong className="job-score-value">{Math.round(job.score ?? 0)}</strong>
-                        <span className="job-score-band">{getFitLabel(job.score ?? 0)}</span>
+                        <strong className="job-score-value">{fitScore}</strong>
+                        <span className="job-score-band">{getFitLabel(fitScore)}</span>
                       </div>
                     </div>
                     <div className="job-meta-row">
@@ -1108,12 +1394,26 @@ function App() {
                       >
                         Open posting
                       </a>
-                      <button
-                        onClick={() => void handleDraft(job.id)}
-                        disabled={busyKey === `draft-${job.id}`}
-                      >
-                        {busyKey === `draft-${job.id}` ? 'Drafting...' : 'Create Draft'}
-                      </button>
+                      {linkedApplication ? (
+                        <button
+                          type="button"
+                          className="button-secondary"
+                          onClick={() => jumpToDraft(linkedApplication.id)}
+                        >
+                          Open draft
+                        </button>
+                      ) : isAppliedJob ? (
+                        <button type="button" className="button-secondary" disabled>
+                          Application recorded
+                        </button>
+                      ) : (
+                        <button
+                          onClick={() => void handleDraft(job.id)}
+                          disabled={busyKey === `draft-${job.id}`}
+                        >
+                          {busyKey === `draft-${job.id}` ? 'Drafting...' : 'Create Draft'}
+                        </button>
+                      )}
                       <button
                         type="button"
                         className="button-secondary"
@@ -1137,6 +1437,11 @@ function App() {
                   </article>
               )})}
             </div>
+          ) : filteredShortlist.length > 0 && appliedShortlistCount > 0 && !showAppliedJobs ? (
+            <div className="empty-state">
+              <p>Only tracked applications match the current shortlist.</p>
+              <span>Use "Show applied" to review greyed-out roles that already have a recorded application state.</span>
+            </div>
           ) : rankedJobs.length > 0 ? (
             <div className="empty-state">
               <p>No roles match the current filters.</p>
@@ -1151,11 +1456,12 @@ function App() {
               </span>
             </div>
           )}
-        </div>
+          </div>
+        ) : null}
       </section>
 
       <section className="grid two-column">
-        <article className="panel panel-section">
+        <article className="panel panel-section" id="application-drafts-section">
           <div className="panel-header">
             <div className="panel-title-group">
               <p className="panel-kicker">Workflow</p>
@@ -1193,7 +1499,9 @@ function App() {
                             {linkedJob ? `${linkedJob.company} · ${formatJobSource(linkedJob.source)}` : `Draft #${application.id}`}
                           </p>
                         </div>
-                        <span className="count-badge">{formatWorkerStatus(application.status)}</span>
+                        <span className={getWorkerStatusBadgeClassName(application.status)}>
+                          {formatWorkerStatus(application.status)}
+                        </span>
                       </div>
                       <p>{application.tailored_summary}</p>
                       <ul>
@@ -1216,11 +1524,10 @@ function App() {
                           onClick={() => void handleAssistCoverNote(application.id)}
                           disabled={busyKey === `ai-cover-${application.id}`}
                         >
-                          {busyKey === `ai-cover-${application.id}`
-                            ? 'Drafting...'
-                            : draftEditor.cover_note.trim()
-                              ? 'Improve with AI'
-                              : 'Draft with AI'}
+                          <AiAssistLabel
+                            busy={busyKey === `ai-cover-${application.id}`}
+                            hasExistingText={draftEditor.cover_note.trim().length > 0}
+                          />
                         </button>
                       </div>
                       <div className="screening-answer-list">
@@ -1251,11 +1558,10 @@ function App() {
                                 }
                                 disabled={busyKey === `ai-screening-${application.id}-${index}`}
                               >
-                                {busyKey === `ai-screening-${application.id}-${index}`
-                                  ? 'Drafting...'
-                                  : screeningAnswer.answer.trim()
-                                    ? 'Improve with AI'
-                                    : 'Draft with AI'}
+                                <AiAssistLabel
+                                  busy={busyKey === `ai-screening-${application.id}-${index}`}
+                                  hasExistingText={screeningAnswer.answer.trim().length > 0}
+                                />
                               </button>
                             </div>
                           </div>
@@ -1269,6 +1575,28 @@ function App() {
                           <span className="count-badge">
                             {latestRun.preview_summary.review_required_count} review items
                           </span>
+                        </div>
+                      ) : null}
+                      {latestRun || linkedJob ? (
+                        <div className="field-actions">
+                          {latestRun ? (
+                            <button
+                              type="button"
+                              className="button-secondary button-small"
+                              onClick={() => jumpToSection('worker-run-section')}
+                            >
+                              Open latest run
+                            </button>
+                          ) : null}
+                          {linkedJob ? (
+                            <button
+                              type="button"
+                              className="button-secondary button-small"
+                              onClick={() => jumpToJob(linkedJob.id)}
+                            >
+                              Open linked role
+                            </button>
+                          ) : null}
                         </div>
                       ) : null}
                       <div className="button-row draft-actions">
@@ -1322,7 +1650,7 @@ function App() {
           </div>
         </article>
 
-        <article className="panel panel-section">
+        <article className="panel panel-section" id="worker-run-section">
           <div className="panel-header">
             <div className="panel-title-group">
               <p className="panel-kicker">Automation</p>
@@ -1331,7 +1659,7 @@ function App() {
                 Preview extracted fields, edit hard questions, then rerun or submit with approval.
               </p>
             </div>
-            <span className="count-badge">
+            <span className={getWorkerStatusBadgeClassName(lastWorkerRun?.status)}>
               {lastWorkerRun ? formatWorkerStatus(lastWorkerRun.status) : 'No run yet'}
             </span>
           </div>
@@ -1363,9 +1691,29 @@ function App() {
                     {lastWorkerRun.preview_summary.llm_suggestions_count} LLM suggestions
                   </span>
                 </div>
-                <p className="muted worker-path">
-                  {lastWorkerRun.screenshot_path || 'Screenshot path unavailable.'}
-                </p>
+                {lastWorkerRun.screenshot_path ? (
+                  <div className="worker-artifact-card">
+                    <div className="worker-artifact-copy">
+                      <span className="signal-label">Screenshot</span>
+                      <p
+                        className="muted worker-artifact-name"
+                        title={lastWorkerRun.screenshot_path}
+                      >
+                        {formatArtifactFileName(lastWorkerRun.screenshot_path)}
+                      </p>
+                    </div>
+                    <a
+                      href={buildApiUrl(`/api/applications/runs/${lastWorkerRun.id}/screenshot`)}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="button-secondary button-small inline-link-button"
+                    >
+                      Open screenshot
+                    </a>
+                  </div>
+                ) : (
+                  <p className="muted worker-path">Screenshot unavailable.</p>
+                )}
                 <a
                   href={lastWorkerRun.target_url}
                   target="_blank"
@@ -1374,6 +1722,28 @@ function App() {
                 >
                   Open application page
                 </a>
+                {currentRunApplicationId || currentRunJob ? (
+                  <div className="worker-link-row">
+                    {currentRunApplicationId ? (
+                      <button
+                        type="button"
+                        className="button-secondary button-small"
+                        onClick={() => jumpToDraft(currentRunApplicationId)}
+                      >
+                        Open linked draft
+                      </button>
+                    ) : null}
+                    {currentRunJob ? (
+                      <button
+                        type="button"
+                        className="button-secondary button-small"
+                        onClick={() => jumpToJob(currentRunJob.id)}
+                      >
+                        Open linked role
+                      </button>
+                    ) : null}
+                  </div>
+                ) : null}
 
                 {lastWorkerRun.review_items.length > 0 ? (
                   <div className="worker-review-section">
@@ -1412,9 +1782,18 @@ function App() {
                                   busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
                                 }
                               >
-                                {busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
-                                  ? 'Drafting...'
-                                  : 'Draft with AI'}
+                                <AiAssistLabel
+                                  busy={
+                                    busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
+                                  }
+                                  hasExistingText={
+                                    (
+                                      reviewValueLookup[field.field_id] ??
+                                      field.answer_value ??
+                                      ''
+                                    ).trim().length > 0
+                                  }
+                                />
                               </button>
                             </div>
                           ) : null}
@@ -1520,6 +1899,21 @@ function App() {
 }
 
 export default App
+
+function AiAssistLabel({
+  busy,
+  hasExistingText,
+}: {
+  busy: boolean
+  hasExistingText: boolean
+}) {
+  return (
+    <>
+      <img src={aiImprovementIcon} alt="" aria-hidden="true" className="button-icon" />
+      <span>{busy ? 'Drafting...' : hasExistingText ? 'Improve with AI' : 'Draft with AI'}</span>
+    </>
+  )
+}
 
 function renderFieldEditor({
   field,
@@ -1631,15 +2025,64 @@ function buildWorkerStatusMessage(result: WorkerRunResponse) {
     return `Preview ready with ${result.preview_summary.autofill_ready_count} autofill-ready fields.`
   }
   if (result.status === 'ready_for_submit') {
+    if (result.logs.some((log) => log.includes('skipped final submit'))) {
+      return 'Application was not sent because at least one field could not be applied.'
+    }
+    if (result.logs.some((log) => log.includes('Submit button was not detected'))) {
+      return 'Application was not sent. Fields were filled, but the submit button was not detected.'
+    }
     return 'Fields were filled and the application is ready for final submit review.'
   }
+  if (result.status === 'submit_clicked') {
+    return 'Submit was clicked, but ATS confirmation was not detected. Review the final page state.'
+  }
   if (result.status === 'submitted') {
-    return 'Application submitted from the approved V2 flow.'
+    return 'Application submission was confirmed by the ATS.'
   }
   if (result.status === 'failed') {
     return 'The worker failed while extracting or filling the application.'
   }
   return 'Worker run completed.'
+}
+
+function getWorkerToastTone(result: WorkerRunResponse, requestedSubmit: boolean): ToastTone {
+  if (result.status === 'submitted') {
+    return 'success'
+  }
+  if (result.status === 'submit_clicked') {
+    return 'warning'
+  }
+  if (result.status === 'failed') {
+    return 'error'
+  }
+  if (result.status === 'awaiting_answers') {
+    return 'warning'
+  }
+  if (result.status === 'ready_for_submit') {
+    if (
+      result.logs.some(
+        (log) =>
+          log.includes('skipped final submit') || log.includes('Submit button was not detected'),
+      )
+    ) {
+      return 'error'
+    }
+    return requestedSubmit ? 'warning' : 'success'
+  }
+  return 'success'
+}
+
+function getToastToneLabel(tone: ToastTone) {
+  if (tone === 'error') {
+    return 'Error'
+  }
+  if (tone === 'warning') {
+    return 'Needs attention'
+  }
+  if (tone === 'success') {
+    return 'Completed'
+  }
+  return 'Update'
 }
 
 function buildDeleteStatusMessage(result: {
@@ -1672,12 +2115,45 @@ function buildBulkDeleteStatusMessage(result: {
   return `Deleted ${leadCount} filtered lead${leadCount === 1 ? '' : 's'} and cleaned up ${draftCount} draft${draftCount === 1 ? '' : 's'} plus ${runCount} worker run${runCount === 1 ? '' : 's'}.`
 }
 
+function getTrackedJobStatus(
+  job: JobLeadResponse,
+  linkedApplication?: ApplicationDraftResponse | null,
+) {
+  if (linkedApplication?.status) {
+    return linkedApplication.status
+  }
+  return isRecordedApplicationStatus(job.status) ? job.status : null
+}
+
+function isRecordedApplicationStatus(status?: string | null) {
+  return status === 'submitted' || status === 'submit_clicked'
+}
+
+function getShortlistJobPriority(status?: string | null) {
+  if (!status) {
+    return 0
+  }
+  if (isRecordedApplicationStatus(status)) {
+    return 2
+  }
+  return 1
+}
+
 function getFieldDisplayName(field: WorkerFieldState) {
   return field.label || field.question_text || field.canonical_label || field.field_id
 }
 
 function formatConfidence(value: number) {
   return `${Math.round((value || 0) * 100)}%`
+}
+
+function formatArtifactFileName(path: string) {
+  const normalized = path.trim()
+  if (!normalized) {
+    return 'artifact'
+  }
+  const segments = normalized.split(/[\\/]/).filter(Boolean)
+  return segments[segments.length - 1] ?? normalized
 }
 
 function formatAnswerSource(source: string) {
@@ -1709,13 +2185,29 @@ function formatWorkerStatus(status: string) {
   if (status === 'ready_for_submit') {
     return 'Ready to submit'
   }
+  if (status === 'submit_clicked') {
+    return 'Submit clicked'
+  }
   if (status === 'submitted') {
-    return 'Submitted'
+    return 'Application sent'
   }
   if (status === 'failed') {
     return 'Failed'
   }
   return status.replace(/_/g, ' ')
+}
+
+function getWorkerStatusBadgeClassName(status?: string | null) {
+  const tone =
+    status === 'submitted'
+      ? 'success'
+      : status === 'failed'
+        ? 'error'
+        : status === 'submit_clicked' || status === 'awaiting_answers'
+          ? 'warning'
+          : null
+
+  return tone ? `count-badge count-badge-${tone}` : 'count-badge'
 }
 
 function canAssistField(field: WorkerFieldState) {
@@ -1755,6 +2247,22 @@ function getFitLabel(score: number) {
     return 'Low'
   }
   return 'Weak'
+}
+
+function getFitScoreCardStyle(score: number): CSSProperties {
+  const clampedScore = Math.max(0, Math.min(100, score))
+  const hue = Math.round((clampedScore / 100) * 120)
+  const intensity = clampedScore / 100
+
+  return {
+    '--score-border': `hsla(${hue}, 78%, 56%, ${0.3 + intensity * 0.22})`,
+    '--score-bg-top': `hsla(${hue}, 82%, 52%, ${0.18 + intensity * 0.14})`,
+    '--score-bg-bottom': `hsla(${hue}, 68%, 20%, ${0.08 + intensity * 0.12})`,
+    '--score-shadow': `0 16px 28px hsla(${hue}, 88%, 40%, ${0.1 + intensity * 0.18})`,
+    '--score-value-color': `hsl(${hue}, 92%, ${68 - intensity * 6}%)`,
+    '--score-label-color': `hsla(${hue}, 68%, 84%, 0.88)`,
+    '--score-band-color': `hsla(${hue}, 76%, 74%, 0.92)`,
+  } as CSSProperties
 }
 
 function formatJobSource(source: string) {

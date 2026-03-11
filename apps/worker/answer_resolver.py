@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from rapidfuzz import fuzz
 
 from apps.api.app.schemas import WorkerFieldState, WorkerPreviewSummary, WorkerRunRequest
@@ -32,6 +34,22 @@ def resolve_fields(
                 )
             )
             continue
+
+        if field.canonical_key == "phone_country_code":
+            country_code_answer = _resolve_phone_country_code(field, request)
+            if country_code_answer:
+                resolved_fields.append(
+                    field.model_copy(
+                        update={
+                            "answer_value": country_code_answer,
+                            "answer_source": "profile",
+                            "answer_confidence": 0.94,
+                            "requires_review": False,
+                            "review_reason": None,
+                        }
+                    )
+                )
+                continue
 
         if field.canonical_key and known_answers.get(field.canonical_key):
             resolved_fields.append(
@@ -93,6 +111,19 @@ def build_preview_summary(fields: list[WorkerFieldState]) -> WorkerPreviewSummar
 def _resolve_custom_question(
     field: WorkerFieldState, request: WorkerRunRequest, llm_client: LLMClient
 ) -> WorkerFieldState:
+    if field.options and field.field_type in {"select", "radio", "checkbox"}:
+        if field.required:
+            return field.model_copy(
+                update={
+                    "requires_review": True,
+                    "review_reason": "Choice field requires an explicit selection before submission.",
+                    "answer_value": None,
+                    "answer_source": None,
+                    "answer_confidence": 0.0,
+                }
+            )
+        return field
+
     matched_screening_answer = _matching_screening_answer(field.question_text, request)
     if matched_screening_answer:
         return field.model_copy(
@@ -201,6 +232,71 @@ def _fallback_custom_answer(field: WorkerFieldState, request: WorkerRunRequest) 
     if "additional" in prompt and request.profile.summary:
         return request.profile.summary
     return None
+
+
+def _resolve_phone_country_code(field: WorkerFieldState, request: WorkerRunRequest) -> str | None:
+    phone = (request.profile.phone or "").strip()
+    location = (request.profile.location or "").strip()
+    dial_code_match = re.search(r"\+\d{1,4}", phone)
+    dial_code = dial_code_match.group(0) if dial_code_match else ""
+    if not dial_code:
+        return None
+
+    normalized_location_tokens = _location_country_tokens(location)
+    matching_options = [
+        option
+        for option in field.options
+        if dial_code in option.label or dial_code in option.value
+    ]
+    if not matching_options:
+        return None
+
+    if normalized_location_tokens:
+        for option in matching_options:
+            normalized_label = _normalize(option.label)
+            if any(token in normalized_label for token in normalized_location_tokens):
+                return option.label
+
+    if len(matching_options) == 1:
+        return matching_options[0].label
+    return None
+
+
+def _location_country_tokens(location: str) -> list[str]:
+    normalized = _normalize(location)
+    if not normalized:
+        return []
+
+    tokens = {normalized}
+    for part in normalized.split():
+        if part:
+            tokens.add(part)
+    if "," in location:
+        for part in location.split(","):
+            part_normalized = _normalize(part)
+            if part_normalized:
+                tokens.add(part_normalized)
+
+    aliases = {
+        "uk": "united kingdom",
+        "u k": "united kingdom",
+        "gb": "united kingdom",
+        "great britain": "united kingdom",
+        "england": "united kingdom",
+        "us": "united states",
+        "u s": "united states",
+        "usa": "united states",
+        "u s a": "united states",
+    }
+    expanded = set(tokens)
+    for token in list(tokens):
+        if token in aliases:
+            expanded.add(aliases[token])
+    return list(expanded)
+
+
+def _normalize(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
 def _answer_source(canonical_key: str) -> str:

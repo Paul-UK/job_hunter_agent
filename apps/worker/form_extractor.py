@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from playwright.sync_api import Error as PlaywrightError
+
 from apps.api.app.schemas import WorkerFieldOption, WorkerFieldState
 
 
@@ -42,24 +44,55 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
             }
             return `//${parts.join('/')}`
           }
-          const selectorFor = (element) => {
+          const selectorCandidatesFor = (element) => {
             const tag = element.tagName.toLowerCase()
+            const candidates = []
+            const push = (candidate) => {
+              if (candidate && !candidates.includes(candidate)) {
+                candidates.push(candidate)
+              }
+            }
             if (element.id) {
-              return `#${CSS.escape(element.id)}`
+              push(`#${CSS.escape(element.id)}`)
+            }
+            const dataTestId = attr(element, 'data-testid')
+            if (dataTestId) {
+              push(`${tag}[data-testid="${quote(dataTestId)}"]`)
+            }
+            const dataTestIdAlt = attr(element, 'data-test-id')
+            if (dataTestIdAlt) {
+              push(`${tag}[data-test-id="${quote(dataTestIdAlt)}"]`)
+            }
+            const dataQa = attr(element, 'data-qa')
+            if (dataQa) {
+              push(`${tag}[data-qa="${quote(dataQa)}"]`)
+            }
+            const dataAutomationId = attr(element, 'data-automation-id')
+            if (dataAutomationId) {
+              push(`${tag}[data-automation-id="${quote(dataAutomationId)}"]`)
             }
             const name = attr(element, 'name')
             if (name) {
-              return `${tag}[name="${quote(name)}"]`
+              push(`${tag}[name="${quote(name)}"]`)
+            }
+            const autocomplete = attr(element, 'autocomplete')
+            if (autocomplete) {
+              push(`${tag}[autocomplete="${quote(autocomplete)}"]`)
             }
             const ariaLabel = attr(element, 'aria-label')
             if (ariaLabel) {
-              return `${tag}[aria-label="${quote(ariaLabel)}"]`
+              push(`${tag}[aria-label="${quote(ariaLabel)}"]`)
             }
             const placeholder = attr(element, 'placeholder')
             if (placeholder) {
-              return `${tag}[placeholder="${quote(placeholder)}"]`
+              push(`${tag}[placeholder="${quote(placeholder)}"]`)
             }
-            return `xpath=${xpathForElement(element)}`
+            push(`xpath=${xpathForElement(element)}`)
+            return candidates
+          }
+          const selectorFor = (element) => {
+            const selectors = selectorCandidatesFor(element)
+            return selectors[0] || `xpath=${xpathForElement(element)}`
           }
           const labelText = (element) => {
             const associatedLabels = element.labels ? Array.from(element.labels) : []
@@ -130,24 +163,59 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
               input_type: inputType,
               html_name: attr(element, 'name') || null,
               html_id: attr(element, 'id') || null,
+              role: attr(element, 'role') || null,
               placeholder: attr(element, 'placeholder') || null,
               label,
               question_text: question,
               required,
               section: sectionText(element) || null,
               selector: selectorFor(element),
+              selector_candidates: selectorCandidatesFor(element),
               ...extra,
             }
           }
+          const choiceOptionRecord = (element) => {
+            const optionLabel =
+              labelText(element) ||
+              attr(element, 'aria-label') ||
+              text(element) ||
+              attr(element, 'value') ||
+              attr(element, 'data-value')
+            const optionValue =
+              attr(element, 'value') ||
+              attr(element, 'data-value') ||
+              attr(element, 'data-key') ||
+              optionLabel ||
+              'option'
+            return {
+              label: optionLabel || 'Option',
+              value: optionValue,
+              selector: selectorFor(element),
+              selector_candidates: selectorCandidatesFor(element),
+            }
+          }
+          const listboxForElement = (element) => {
+            const controlledIds = [attr(element, 'aria-controls'), attr(element, 'aria-owns')]
+              .flatMap((value) => value.split(' ').filter(Boolean))
+            for (const id of controlledIds) {
+              const controlled = document.getElementById(id)
+              if (controlled) {
+                return controlled
+              }
+            }
+            return null
+          }
+          const seen = new Set()
 
           const groupedRecords = new Map()
           const output = []
           for (const element of Array.from(document.querySelectorAll('input, textarea, select'))) {
             const tag = element.tagName.toLowerCase()
             const inputType = tag === 'input' ? (attr(element, 'type') || 'text').toLowerCase() : tag
-            if (inputType === 'hidden' || !isVisible(element)) {
+            if (inputType === 'hidden' || attr(element, 'aria-hidden') === 'true' || !isVisible(element)) {
               continue
             }
+            seen.add(element)
 
             if (inputType === 'radio') {
               const groupKey = `radio:${attr(element, 'name') || attr(element, 'id') || selectorFor(element)}`
@@ -159,6 +227,7 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
                 label: labelText(element) || attr(element, 'value') || 'Option',
                 value: attr(element, 'value') || labelText(element) || 'option',
                 selector: selectorFor(element),
+                selector_candidates: selectorCandidatesFor(element),
               })
               groupedRecords.set(groupKey, group)
               continue
@@ -178,6 +247,7 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
                   label: labelText(element) || attr(element, 'value') || 'Option',
                   value: attr(element, 'value') || labelText(element) || 'option',
                   selector: selectorFor(element),
+                  selector_candidates: selectorCandidatesFor(element),
                 })
                 groupedRecords.set(groupKey, group)
                 continue
@@ -191,6 +261,7 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
                   label: text(option) || attr(option, 'value') || 'Option',
                   value: attr(option, 'value') || text(option) || 'option',
                   selector: selectorFor(element),
+                  selector_candidates: selectorCandidatesFor(element),
                 })),
               })
               continue
@@ -202,11 +273,228 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
             })
           }
 
+          for (const element of Array.from(
+            document.querySelectorAll('[role="combobox"], button[aria-haspopup="listbox"], [aria-haspopup="listbox"][aria-controls]')
+          )) {
+            if (seen.has(element) || !isVisible(element) || ['input', 'textarea', 'select'].includes(element.tagName.toLowerCase())) {
+              continue
+            }
+            seen.add(element)
+            const listbox = listboxForElement(element)
+            const optionNodes = listbox ? Array.from(listbox.querySelectorAll('[role="option"]')) : []
+            output.push({
+              ...makeBaseRecord(element, {
+                field_type: 'select',
+                input_type: attr(element, 'role') || 'combobox',
+              }),
+              options: optionNodes.map((option) => choiceOptionRecord(option)),
+            })
+          }
+
+          for (const group of Array.from(document.querySelectorAll('[role="radiogroup"]'))) {
+            if (seen.has(group) || !isVisible(group)) {
+              continue
+            }
+            seen.add(group)
+            const optionNodes = Array.from(group.querySelectorAll('[role="radio"]'))
+            output.push({
+              ...makeBaseRecord(group, {
+                field_type: 'radio',
+                input_type: 'radiogroup',
+              }),
+              options: optionNodes.map((option) => choiceOptionRecord(option)),
+            })
+          }
+
+          for (const group of Array.from(document.querySelectorAll('[role="group"]'))) {
+            if (seen.has(group) || !isVisible(group)) {
+              continue
+            }
+            const optionNodes = Array.from(group.querySelectorAll('[role="checkbox"]'))
+            if (optionNodes.length === 0) {
+              continue
+            }
+            seen.add(group)
+            output.push({
+              ...makeBaseRecord(group, {
+                field_type: 'checkbox',
+                input_type: 'checkboxgroup',
+              }),
+              options: optionNodes.map((option) => choiceOptionRecord(option)),
+            })
+          }
+
           return [...output, ...Array.from(groupedRecords.values())]
         }
         """
     )
+    raw_fields = _augment_combobox_fields(page, raw_fields)
+    raw_fields = [item for item in raw_fields if not _is_placeholder_shadow_input(item)]
     return [_to_field_state(item, index) for index, item in enumerate(raw_fields)]
+
+
+def _augment_combobox_fields(page, raw_fields: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    for item in raw_fields:
+        if item.get("role") != "combobox":
+            continue
+        options = _collect_combobox_options(page, item)
+        if not options:
+            continue
+        item["field_type"] = "select"
+        item["input_type"] = "combobox"
+        item["options"] = options
+    return raw_fields
+
+
+def _collect_combobox_options(page, item: dict[str, Any]) -> list[dict[str, Any]]:
+    selector = str(item.get("selector") or "").strip()
+    if not selector:
+        return []
+
+    try:
+        locator = page.locator(selector).first
+        if locator.count() == 0 or not locator.is_visible():
+            return []
+        locator.click(timeout=3000)
+        page.wait_for_timeout(200)
+        options = page.evaluate(
+            """
+            ({ selector, htmlId }) => {
+              const visible = (element) => {
+                const style = window.getComputedStyle(element)
+                const rect = element.getBoundingClientRect()
+                return (
+                  style.display !== 'none' &&
+                  style.visibility !== 'hidden' &&
+                  rect.width > 0 &&
+                  rect.height > 0
+                )
+              }
+              const compress = (value) => (value || '').replace(/\\s+/g, ' ').trim()
+              const quote = (value) => String(value).replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\\\\\"')
+              const attr = (element, name) => compress(element.getAttribute(name))
+              const text = (element) => compress(element?.innerText || element?.textContent || '')
+              const xpathForElement = (element) => {
+                if (element.id) {
+                  return `//*[@id="${quote(element.id)}"]`
+                }
+                const parts = []
+                let current = element
+                while (current && current.nodeType === Node.ELEMENT_NODE) {
+                  const siblings = current.parentNode
+                    ? Array.from(current.parentNode.children).filter(
+                        (candidate) => candidate.tagName === current.tagName
+                      )
+                    : [current]
+                  const index = siblings.indexOf(current) + 1
+                  parts.unshift(`${current.tagName.toLowerCase()}[${index}]`)
+                  current = current.parentElement
+                }
+                return `//${parts.join('/')}`
+              }
+              const selectorCandidatesFor = (element) => {
+                const tag = element.tagName.toLowerCase()
+                const candidates = []
+                const push = (candidate) => {
+                  if (candidate && !candidates.includes(candidate)) {
+                    candidates.push(candidate)
+                  }
+                }
+                if (element.id) {
+                  push(`#${CSS.escape(element.id)}`)
+                }
+                const dataTestId = attr(element, 'data-testid')
+                if (dataTestId) {
+                  push(`${tag}[data-testid="${quote(dataTestId)}"]`)
+                }
+                const dataQa = attr(element, 'data-qa')
+                if (dataQa) {
+                  push(`${tag}[data-qa="${quote(dataQa)}"]`)
+                }
+                const dataValue = attr(element, 'data-value')
+                if (dataValue) {
+                  push(`${tag}[data-value="${quote(dataValue)}"]`)
+                }
+                const ariaLabel = attr(element, 'aria-label')
+                if (ariaLabel) {
+                  push(`${tag}[aria-label="${quote(ariaLabel)}"]`)
+                }
+                push(`xpath=${xpathForElement(element)}`)
+                return candidates
+              }
+              const selectorFor = (element) => selectorCandidatesFor(element)[0]
+              const input = document.querySelector(selector)
+              if (!input) {
+                return []
+              }
+
+              const candidateIds = []
+              const pushId = (value) => {
+                if (value && !candidateIds.includes(value)) {
+                  candidateIds.push(value)
+                }
+              }
+              const controls = [input.getAttribute('aria-controls'), input.getAttribute('aria-owns')]
+                .filter(Boolean)
+                .flatMap((value) => value.split(' ').map((part) => part.trim()).filter(Boolean))
+              for (const value of controls) {
+                pushId(value)
+              }
+              if (htmlId) {
+                pushId(`react-select-${htmlId}-listbox`)
+              }
+
+              const listboxes = candidateIds
+                .map((id) => document.getElementById(id))
+                .filter((element) => element && visible(element))
+              const visibleListboxes = listboxes.length
+                ? listboxes
+                : Array.from(document.querySelectorAll('[role="listbox"]')).filter((element) => visible(element))
+
+              const optionNodes = visibleListboxes.length
+                ? visibleListboxes.flatMap((listbox) => Array.from(listbox.querySelectorAll('[role="option"]')))
+                : Array.from(document.querySelectorAll('[role="option"]')).filter((element) => visible(element))
+
+              const results = []
+              const seen = new Set()
+              for (const option of optionNodes) {
+                const label = text(option)
+                const value = attr(option, 'data-value') || attr(option, 'value') || label
+                if (!label || seen.has(`${label}::${value}`)) {
+                  continue
+                }
+                seen.add(`${label}::${value}`)
+                results.push({
+                  label,
+                  value,
+                  selector: selectorFor(option),
+                  selector_candidates: selectorCandidatesFor(option),
+                })
+              }
+              return results
+            }
+            """,
+            {"selector": selector, "htmlId": item.get("html_id")},
+        )
+    except PlaywrightError:
+        return []
+    finally:
+        try:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(50)
+        except PlaywrightError:
+            pass
+    return options
+
+
+def _is_placeholder_shadow_input(item: dict[str, Any]) -> bool:
+    if item.get("role") != "combobox":
+        return False
+    if item.get("html_id") or item.get("html_name"):
+        return False
+    label = str(item.get("label") or "").strip()
+    question_text = str(item.get("question_text") or "").strip().lower()
+    return not label and question_text in {"select...", "select"}
 
 
 def _to_field_state(item: dict[str, Any], index: int) -> WorkerFieldState:
@@ -216,6 +504,15 @@ def _to_field_state(item: dict[str, Any], index: int) -> WorkerFieldState:
             label=str(option.get("label") or "Option"),
             value=str(option.get("value") or ""),
             selector=str(option.get("selector") or item.get("selector") or ""),
+            selector_candidates=[
+                str(candidate)
+                for candidate in (
+                    option.get("selector_candidates")
+                    or item.get("selector_candidates")
+                    or [option.get("selector") or item.get("selector") or ""]
+                )
+                if str(candidate or "").strip()
+            ],
         )
         for option in item.get("options", [])
     ]
@@ -224,6 +521,11 @@ def _to_field_state(item: dict[str, Any], index: int) -> WorkerFieldState:
         label=str(item.get("label") or ""),
         question_text=str(item.get("question_text") or ""),
         selector=str(item.get("selector") or ""),
+        selector_candidates=[
+            str(candidate)
+            for candidate in (item.get("selector_candidates") or [item.get("selector") or ""])
+            if str(candidate or "").strip()
+        ],
         field_type=str(item.get("field_type") or "text"),
         input_type=item.get("input_type"),
         html_name=item.get("html_name"),

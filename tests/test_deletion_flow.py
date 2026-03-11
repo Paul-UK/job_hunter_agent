@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
+from apps.api.app.config import settings
 from apps.api.app.db import SessionLocal
 from apps.api.app.models import ApplicationDraft, JobLead, WorkerRun
 
@@ -61,6 +62,22 @@ def test_delete_worker_run_preserves_draft(client):
         assert len(session.execute(select(JobLead)).scalars().all()) == 1
         assert len(session.execute(select(ApplicationDraft)).scalars().all()) == 1
         assert session.execute(select(WorkerRun)).scalars().all() == []
+
+
+def test_read_worker_run_screenshot_returns_artifact_file(client):
+    seed_profile(client)
+    job_id = create_job()
+    draft = client.post(f"/api/jobs/{job_id}/draft").json()
+    screenshot_dir = settings.artifacts_dir / "screenshots"
+    screenshot_dir.mkdir(parents=True, exist_ok=True)
+    screenshot_path = screenshot_dir / "worker-test-shot.png"
+    screenshot_path.write_bytes(b"fake image bytes")
+    run_id = create_worker_run(draft["id"], screenshot_path=str(screenshot_path))
+
+    response = client.get(f"/api/applications/runs/{run_id}/screenshot")
+
+    assert response.status_code == 200
+    assert response.content == b"fake image bytes"
 
 
 def test_bulk_delete_jobs_cascades_related_records(client):
@@ -138,7 +155,7 @@ def create_job(*, external_id: str = "delete-fixture") -> int:
         return job.id
 
 
-def create_worker_run(application_draft_id: int) -> int:
+def create_worker_run(application_draft_id: int, *, screenshot_path: str | None = None) -> int:
     with SessionLocal() as session:
         worker_run = WorkerRun(
             application_draft_id=application_draft_id,
@@ -154,7 +171,7 @@ def create_worker_run(application_draft_id: int) -> int:
             profile_snapshot={},
             job_snapshot={},
             draft_snapshot={},
-            screenshot_path=None,
+            screenshot_path=screenshot_path,
         )
         session.add(worker_run)
         session.commit()
