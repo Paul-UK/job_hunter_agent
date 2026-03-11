@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from apps.api.app.config import settings
 from apps.api.app.models import ApplicationDraft, CandidateProfile, JobLead, ProfileSource, WorkerRun
 from apps.api.app.schemas import CandidateProfilePayload, ProfileSourcePayload
 from apps.api.app.services.matching import rank_job
@@ -18,7 +19,8 @@ def get_latest_profile(session: Session) -> CandidateProfile | None:
 def get_profile_payload(profile: CandidateProfile | None) -> CandidateProfilePayload | None:
     if profile is None or not profile.merged_profile:
         return None
-    return CandidateProfilePayload.model_validate(profile.merged_profile)
+    payload = CandidateProfilePayload.model_validate(profile.merged_profile)
+    return payload if _profile_has_content(payload) else None
 
 
 def save_profile_source(
@@ -97,6 +99,7 @@ def list_profile_sources(session: Session) -> list[ProfileSourcePayload]:
     ).scalars()
     return [
         ProfileSourcePayload(
+            id=row.id,
             source_type=row.source_type,
             source_label=row.source_label,
             confidence=row.confidence,
@@ -104,6 +107,42 @@ def list_profile_sources(session: Session) -> list[ProfileSourcePayload]:
         )
         for row in rows
     ]
+
+
+def delete_profile_source(session: Session, source_id: int) -> dict[str, int] | None:
+    source = session.execute(select(ProfileSource).where(ProfileSource.id == source_id)).scalar_one_or_none()
+    if source is None:
+        return None
+
+    profile = source.profile
+    if profile is None:
+        session.delete(source)
+        session.commit()
+        return {"remaining_sources": 0}
+
+    latest_cv_source = _latest_profile_source(session, profile.id, "cv")
+    removed_current_resume = (
+        source.source_type == "cv"
+        and latest_cv_source is not None
+        and latest_cv_source.id == source.id
+    )
+
+    session.delete(source)
+    session.flush()
+    if removed_current_resume:
+        _delete_resume_artifacts()
+
+    _rebuild_profile_after_source_delete(
+        session,
+        profile,
+        removed_source_type=source.source_type,
+        removed_current_resume=removed_current_resume,
+    )
+    remaining_sources = session.execute(
+        select(ProfileSource).where(ProfileSource.profile_id == profile.id)
+    ).scalars().all()
+    session.commit()
+    return {"remaining_sources": len(remaining_sources)}
 
 
 def upsert_job_lead(session: Session, payload: dict) -> JobLead:
@@ -148,12 +187,172 @@ def list_worker_runs(session: Session, limit: int = 10) -> list[WorkerRun]:
     )
 
 
+def delete_job_lead(session: Session, job_id: int) -> dict[str, int] | None:
+    job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one_or_none()
+    if job is None:
+        return None
+
+    deleted_counts = _delete_job_lead_records(session, job)
+    session.commit()
+    return deleted_counts
+
+
+def delete_job_leads(session: Session, job_ids: list[int]) -> tuple[list[int], dict[str, int]]:
+    normalized_ids = list(dict.fromkeys(job_id for job_id in job_ids if job_id > 0))
+    if not normalized_ids:
+        return [], {"job_leads": 0, "application_drafts": 0, "worker_runs": 0}
+
+    jobs = session.execute(
+        select(JobLead).where(JobLead.id.in_(normalized_ids)).order_by(JobLead.id)
+    ).scalars().all()
+    deleted_ids: list[int] = []
+    deleted_counts = {"job_leads": 0, "application_drafts": 0, "worker_runs": 0}
+    for job in jobs:
+        counts = _delete_job_lead_records(session, job)
+        deleted_ids.append(job.id)
+        deleted_counts["job_leads"] += 1
+        deleted_counts["application_drafts"] += counts["application_drafts"]
+        deleted_counts["worker_runs"] += counts["worker_runs"]
+
+    session.commit()
+    return deleted_ids, deleted_counts
+
+
+def delete_application_draft(session: Session, application_id: int) -> dict[str, int] | None:
+    draft = session.execute(
+        select(ApplicationDraft).where(ApplicationDraft.id == application_id)
+    ).scalar_one_or_none()
+    if draft is None:
+        return None
+
+    deleted_counts = {"worker_runs": _delete_application_draft_records(session, draft)}
+    session.commit()
+    return deleted_counts
+
+
+def delete_worker_run(session: Session, run_id: int) -> dict[str, int] | None:
+    worker_run = session.execute(
+        select(WorkerRun).where(WorkerRun.id == run_id)
+    ).scalar_one_or_none()
+    if worker_run is None:
+        return None
+
+    session.delete(worker_run)
+    session.commit()
+    return {}
+
+
 def rerank_all_jobs(session: Session, profile_payload: CandidateProfilePayload) -> None:
     jobs = session.execute(select(JobLead)).scalars().all()
     for job in jobs:
         ranking = rank_job(profile_payload, _job_to_payload(job))
         job.score = ranking.score
         job.score_details = ranking.model_dump(mode="json")
+
+
+def _delete_application_draft_records(session: Session, draft: ApplicationDraft) -> int:
+    worker_runs = session.execute(
+        select(WorkerRun).where(WorkerRun.application_draft_id == draft.id)
+    ).scalars().all()
+    for worker_run in worker_runs:
+        session.delete(worker_run)
+
+    session.delete(draft)
+    return len(worker_runs)
+
+
+def _delete_job_lead_records(session: Session, job: JobLead) -> dict[str, int]:
+    drafts = session.execute(
+        select(ApplicationDraft).where(ApplicationDraft.job_lead_id == job.id)
+    ).scalars().all()
+    deleted_counts = {
+        "application_drafts": len(drafts),
+        "worker_runs": 0,
+    }
+    for draft in drafts:
+        deleted_counts["worker_runs"] += _delete_application_draft_records(session, draft)
+
+    session.delete(job)
+    return deleted_counts
+
+
+def _rebuild_profile_after_source_delete(
+    session: Session,
+    profile: CandidateProfile,
+    *,
+    removed_source_type: str,
+    removed_current_resume: bool,
+) -> None:
+    latest_cv_source = _latest_profile_source(session, profile.id, "cv")
+    latest_linkedin_source = _latest_profile_source(session, profile.id, "linkedin")
+
+    if profile.source_of_truth == "manual":
+        merged_profile = CandidateProfilePayload.model_validate(
+            profile.merged_profile or CandidateProfilePayload().model_dump(mode="json")
+        )
+        if removed_source_type == "cv" and removed_current_resume:
+            merged_links = dict(merged_profile.links)
+            merged_links.pop("resume_path", None)
+            merged_profile = merged_profile.model_copy(update={"links": merged_links})
+            profile.merged_profile = merged_profile.model_dump(mode="json")
+        profile.raw_cv_text = latest_cv_source.raw_text if latest_cv_source else None
+        rerank_all_jobs(session, merged_profile)
+        return
+
+    cv_payload = _payload_from_source(latest_cv_source)
+    linkedin_payload = _payload_from_source(latest_linkedin_source)
+    merged_payload, field_sources = merge_profile_payloads(cv_payload, linkedin_payload)
+
+    profile.full_name = merged_payload.full_name
+    profile.headline = merged_payload.headline
+    profile.email = merged_payload.email
+    profile.phone = merged_payload.phone
+    profile.location = merged_payload.location
+    profile.raw_cv_text = latest_cv_source.raw_text if latest_cv_source else None
+    profile.source_of_truth = "cv" if latest_cv_source else "linkedin" if latest_linkedin_source else "manual"
+    profile.merged_profile = merged_payload.model_dump(mode="json")
+    profile.field_sources = field_sources
+    rerank_all_jobs(session, merged_payload)
+
+
+def _latest_profile_source(
+    session: Session,
+    profile_id: int,
+    source_type: str,
+) -> ProfileSource | None:
+    return session.execute(
+        select(ProfileSource)
+        .where(ProfileSource.profile_id == profile_id, ProfileSource.source_type == source_type)
+        .order_by(ProfileSource.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _payload_from_source(source: ProfileSource | None) -> CandidateProfilePayload | None:
+    if source is None:
+        return None
+    return CandidateProfilePayload.model_validate(source.parsed_payload)
+
+
+def _delete_resume_artifacts() -> None:
+    upload_dir = settings.data_dir / "uploads"
+    if not upload_dir.exists():
+        return
+    for path in upload_dir.glob("latest_resume.*"):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+
+
+def _profile_has_content(payload: CandidateProfilePayload) -> bool:
+    data = payload.model_dump(mode="json")
+    for value in data.values():
+        if isinstance(value, str) and value.strip():
+            return True
+        if isinstance(value, (list, dict)) and value:
+            return True
+        if value is not None and not isinstance(value, (str, list, dict)):
+            return True
+    return False
 
 
 def _job_to_payload(job: JobLead) -> dict:

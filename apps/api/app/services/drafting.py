@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
+
 from apps.api.app.schemas import CandidateProfilePayload, RankingResult
+from apps.api.app.services.company_research import is_unhelpful_research_text
 
 
 def build_application_draft(
@@ -55,17 +58,19 @@ def _build_screening_answers(
     top_skill = (
         ranking.matched_skills[0] if ranking.matched_skills else "your most relevant experience"
     )
-    company_context = (
-        research.get("github_summary") or research.get("website_summary") or "the team mission"
-    )
     profile_hook = ", ".join(profile.skills[:3]) or "technical breadth"
+    company_context = _research_context_phrase(research)
+    interest_reason = (
+        f"{job.get('company')} stands out because {company_context}."
+        if company_context
+        else f"{job.get('company')} stands out because the role lines up closely with my background."
+    )
     return [
         {
             "question": "Why are you interested in this role?",
             "answer": (
                 f"I am targeting roles where I can apply {top_skill} to practical outcomes. "
-                f"{job.get('company')} stands out because it appears closely connected to "
-                f"{company_context}."
+                f"{interest_reason}"
             ),
         },
         {
@@ -87,12 +92,67 @@ def _build_cover_note(profile: CandidateProfilePayload, job: dict, research: dic
         else " My profile combines practical execution with adaptability."
     )
     company_hook = ""
-    if research.get("website_summary"):
-        company_hook = (
-            f" Your public positioning especially resonated with me: {research['website_summary']}"
-        )
-    elif research.get("github_summary"):
-        company_hook = (
-            f" The engineering signals from GitHub also stood out: {research['github_summary']}"
-        )
+    company_context = _research_context_phrase(research)
+    if company_context:
+        company_hook = f" I was also drawn to the role because {company_context}."
     return intro + profile_hook + company_hook
+
+
+def _research_context_phrase(research: dict) -> str | None:
+    website_summary = _clean_research_summary(research.get("website_summary"))
+    if website_summary:
+        return _extract_company_focus_phrase(website_summary) or (
+            f"your public company narrative highlights {website_summary}"
+        )
+
+    org_description = _clean_research_summary(research.get("org_description"))
+    if org_description:
+        return f"the public company description emphasizes {org_description}"
+
+    top_languages = [language for language in (research.get("top_languages") or []) if language]
+    if top_languages:
+        return f"the public engineering work shows recent activity in {', '.join(top_languages[:3])}"
+
+    github_summary = _clean_research_summary(research.get("github_summary"))
+    if github_summary:
+        return github_summary[0].lower() + github_summary[1:] if github_summary else github_summary
+
+    return None
+
+
+def _clean_research_summary(value: str | None) -> str | None:
+    if not value or is_unhelpful_research_text(value):
+        return None
+
+    cleaned = " ".join(value.split()).strip()
+    if not cleaned:
+        return None
+
+    parts = [part.strip() for part in cleaned.split(".") if part.strip()]
+    if len(parts) > 1 and len(parts[0].split()) <= 6:
+        cleaned = parts[1]
+
+    cleaned = cleaned.rstrip(".")
+    if len(cleaned) > 180:
+        cleaned = cleaned[:177].rsplit(" ", 1)[0] + "..."
+    return cleaned or None
+
+
+def _extract_company_focus_phrase(summary: str) -> str | None:
+    cleaned_summary = summary.strip().rstrip(".")
+    lowered_summary = cleaned_summary.lower()
+
+    working_to_index = lowered_summary.find("working to ")
+    if working_to_index >= 0:
+        return f"the company is {cleaned_summary[working_to_index:]}"
+
+    match = re.match(r"^[A-Z][A-Za-z0-9&' -]+ is (.+)$", cleaned_summary)
+    if match:
+        return f"the company is {match.group(1)}"
+
+    for verb in ["builds", "develops", "creates", "focuses on"]:
+        verb_index = lowered_summary.find(f"{verb} ")
+        if verb_index >= 0:
+            return f"the company {cleaned_summary[verb_index:]}"
+
+    return None

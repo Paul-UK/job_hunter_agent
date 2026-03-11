@@ -132,6 +132,54 @@ class GeminiClient:
             reasoning=str(payload.get("reasoning") or "Gemini drafted answer").strip(),
         )
 
+    def draft_application_material(
+        self,
+        *,
+        material_type: str,
+        question: str | None,
+        current_text: str | None,
+        profile: dict[str, Any],
+        job: dict[str, Any],
+        research: dict[str, Any],
+        supporting_answers: list[dict[str, str]],
+    ) -> DraftedAnswerSuggestion | None:
+        prompt = {
+            "task": "Draft or rewrite grounded application text for a job application.",
+            "material_type": material_type,
+            "mode": "rewrite_existing" if (current_text or "").strip() else "draft_from_context",
+            "constraints": [
+                "Use first person.",
+                "Keep the answer concise and specific.",
+                "Base the answer primarily on the candidate profile and the job description.",
+                "Use company research only if it is clearly about the employer, not the ATS platform.",
+                "Do not invent employers, achievements, metrics, or skills.",
+                "If current_text is weak or generic, rewrite it cleanly instead of appending to it.",
+                "Return JSON only.",
+            ],
+            "question": question,
+            "current_text": (current_text or "").strip() or None,
+            "profile": profile,
+            "job": job,
+            "research": research,
+            "supporting_answers": supporting_answers[:4],
+            "response_shape": {
+                "answer": "string",
+                "confidence": "number 0-1",
+                "reasoning": "short string",
+            },
+        }
+        payload = self._generate_json(prompt)
+        if not payload:
+            return None
+        answer = str(payload.get("answer") or "").strip()
+        if not answer:
+            return None
+        return DraftedAnswerSuggestion(
+            answer=answer,
+            confidence=_as_confidence(payload.get("confidence")),
+            reasoning=str(payload.get("reasoning") or "Gemini drafted application text").strip(),
+        )
+
     def _generate_json(self, prompt: dict[str, Any]) -> dict[str, Any] | None:
         url = f"{GEMINI_BASE_URL}/{self.model}:generateContent"
         payload = {

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 from typing import Protocol
 
 
@@ -45,6 +46,18 @@ class LLMClient(Protocol):
         screening_answers: list[dict[str, str]],
     ) -> DraftedAnswerSuggestion | None: ...
 
+    def draft_application_material(
+        self,
+        *,
+        material_type: str,
+        question: str | None,
+        current_text: str | None,
+        profile: dict[str, Any],
+        job: dict[str, Any],
+        research: dict[str, Any],
+        supporting_answers: list[dict[str, str]],
+    ) -> DraftedAnswerSuggestion | None: ...
+
 
 class DisabledLLMClient:
     def is_enabled(self) -> bool:
@@ -73,5 +86,18 @@ class DisabledLLMClient:
         profile_skills: list[str],
         cover_note: str,
         screening_answers: list[dict[str, str]],
+    ) -> DraftedAnswerSuggestion | None:
+        return None
+
+    def draft_application_material(
+        self,
+        *,
+        material_type: str,
+        question: str | None,
+        current_text: str | None,
+        profile: dict[str, Any],
+        job: dict[str, Any],
+        research: dict[str, Any],
+        supporting_answers: list[dict[str, str]],
     ) -> DraftedAnswerSuggestion | None:
         return None

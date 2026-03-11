@@ -40,6 +40,7 @@ export interface CandidateProfileResponse {
 }
 
 export interface ProfileSourcePayload {
+  id?: number | null
   source_type: ProfileSourceType
   source_label: string
   confidence: Record<string, number>
@@ -87,6 +88,25 @@ export interface ApplicationDraftResponse {
   resume_bullets: string[]
   screening_answers: ScreeningAnswerPayload[]
   status: string
+}
+
+export interface ApplicationDraftAssistResponse {
+  text: string
+  confidence: number
+  reasoning: string
+  updated_draft?: ApplicationDraftResponse | null
+}
+
+export interface DeleteResponse {
+  entity: 'job_lead' | 'application_draft' | 'worker_run' | 'profile_source'
+  deleted_id: number
+  deleted_counts: Record<string, number>
+}
+
+export interface BulkDeleteResponse {
+  entity: 'job_leads'
+  deleted_ids: number[]
+  deleted_counts: Record<string, number>
 }
 
 export interface WorkerFieldOption {
