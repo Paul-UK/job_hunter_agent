@@ -11,6 +11,7 @@ CANONICAL_LABELS = {
     "full_name": "Full name",
     "email": "Email",
     "phone": "Phone",
+    "phone_country_code": "Phone country code",
     "location": "Location",
     "linkedin": "LinkedIn",
     "github": "GitHub",
@@ -151,6 +152,9 @@ def classify_field(field: WorkerFieldState, platform: str, llm_client: LLMClient
 
 
 def _heuristic_classification(field: WorkerFieldState) -> tuple[str, float, str] | None:
+    if _looks_like_phone_country_code(field):
+        return "phone_country_code", 0.93, "Matched phone country code heuristic."
+
     text = _field_text(field)
     for canonical_key, patterns, confidence in HEURISTIC_PATTERNS:
         if any(re.search(pattern, text) for pattern in patterns):
@@ -160,6 +164,20 @@ def _heuristic_classification(field: WorkerFieldState) -> tuple[str, float, str]
         return "resume_path", 0.75, "Defaulted visible file input to resume upload."
 
     return None
+
+
+def _looks_like_phone_country_code(field: WorkerFieldState) -> bool:
+    if field.field_type != "select" or len(field.options) < 20:
+        return False
+
+    text = _field_text(field)
+    has_country_signal = bool(re.search(r"\bcountry\b|\bcountry code\b|\bdial code\b", text))
+    has_dial_code_options = sum(
+        1
+        for option in field.options[:30]
+        if re.search(r"\+\d{1,4}\b", option.label) or re.search(r"\+\d{1,4}\b", option.value)
+    )
+    return has_country_signal and has_dial_code_options >= 5
 
 
 def _looks_like_custom_question(field: WorkerFieldState) -> bool:

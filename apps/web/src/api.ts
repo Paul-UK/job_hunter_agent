@@ -14,8 +14,12 @@ import type {
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? ''
 
+export function buildApiUrl(path: string) {
+  return `${API_BASE}${path}`
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
+  const response = await fetch(buildApiUrl(path), {
     headers: {
       Accept: 'application/json',
       ...(init?.headers ?? {}),

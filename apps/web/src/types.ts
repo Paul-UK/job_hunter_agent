@@ -113,6 +113,7 @@ export interface WorkerFieldOption {
   label: string
   value: string
   selector?: string | null
+  selector_candidates?: string[]
 }
 
 export interface WorkerFieldState {
@@ -120,6 +121,7 @@ export interface WorkerFieldState {
   label: string
   question_text: string
   selector: string
+  selector_candidates?: string[]
   field_type: string
   input_type?: string | null
   html_name?: string | null
@@ -167,6 +169,9 @@ export interface WorkerRunResponse {
     value: string
     field_id?: string | null
     mode?: string
+    option_label?: string | null
+    option_selector?: string | null
+    option_selector_candidates?: string[]
   }>
   logs: string[]
   screenshot_path?: string | null

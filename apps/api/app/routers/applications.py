@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from apps.api.app.config import settings
 from apps.api.app.db import get_session
 from apps.api.app.models import ApplicationDraft, WorkerRun
 from apps.api.app.schemas import (
@@ -53,6 +57,19 @@ def remove_worker_run(run_id: int, session: Session = Depends(get_session)) -> D
         deleted_id=run_id,
         deleted_counts=deleted_counts,
     )
+
+
+@router.get("/runs/{run_id}/screenshot")
+def read_worker_run_screenshot(run_id: int, session: Session = Depends(get_session)) -> FileResponse:
+    worker_run = session.execute(select(WorkerRun).where(WorkerRun.id == run_id)).scalar_one_or_none()
+    if worker_run is None:
+        raise HTTPException(status_code=404, detail="Worker run not found.")
+
+    screenshot_path = _resolve_screenshot_path(worker_run.screenshot_path)
+    if screenshot_path is None:
+        raise HTTPException(status_code=404, detail="Worker run screenshot not found.")
+
+    return FileResponse(path=screenshot_path, filename=screenshot_path.name)
 
 
 @router.post("/{application_id}/assist", response_model=ApplicationDraftAssistResponse)
@@ -221,6 +238,8 @@ def run_application(
         screenshot_path=result["screenshot_path"],
     )
     draft.status = result["status"]
+    if result["status"] in {"submitted", "submit_clicked"}:
+        job.status = result["status"]
     session.add(worker_run)
     session.commit()
     session.refresh(worker_run)
@@ -240,6 +259,19 @@ def _job_to_payload(job) -> dict:
         "requirements": job.requirements,
         "metadata_json": job.metadata_json,
     }
+
+
+def _resolve_screenshot_path(raw_path: str | None) -> Path | None:
+    if not raw_path:
+        return None
+
+    candidate = Path(raw_path).expanduser().resolve()
+    artifacts_root = settings.artifacts_dir.resolve()
+    if not candidate.is_file():
+        return None
+    if not candidate.is_relative_to(artifacts_root):
+        return None
+    return candidate
 
 
 def _upsert_screening_answer(

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from sqlalchemy import select
+
 from apps.api.app.db import SessionLocal
 from apps.api.app.models import JobLead
 from apps.api.app.services.llm.base import DraftedAnswerSuggestion
@@ -69,7 +71,7 @@ def test_worker_submit_with_review_overrides_submits_greenhouse_form(client):
     assert draft_response.status_code == 200
     draft = draft_response.json()
 
-    fixture_html = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
+    fixture_html = confirmed_greenhouse_submit_fixture_html()
     worker_response = client.post(
         f"/api/applications/{draft['id']}/run",
         json={
@@ -92,6 +94,49 @@ def test_worker_submit_with_review_overrides_submits_greenhouse_form(client):
     assert worker_run["preview_summary"]["unresolved_required_count"] == 0
     assert any(action["field"] == "work_authorization" for action in worker_run["actions"])
     assert any(action["field"] == "custom_question" for action in worker_run["actions"])
+    assert any("confirmation" in log.lower() for log in worker_run["logs"])
+
+    with SessionLocal() as session:
+        job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one()
+        assert job.status == "submitted"
+
+
+def test_worker_submit_without_confirmation_marks_submit_clicked(client):
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/fixture-2b",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": unconfirmed_greenhouse_submit_fixture_html(),
+            "answer_overrides": [
+                {"field_id": "question-work-auth", "value": "Yes"},
+                {
+                    "field_id": "question-why-anthropic",
+                    "value": "Anthropic sits at the intersection of AI quality, support, and real customer impact.",
+                },
+            ],
+        },
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "submit_clicked"
+    assert any("clicked submit" in log.lower() for log in worker_run["logs"])
+    assert any("confirmation was not detected" in log.lower() for log in worker_run["logs"])
+
+    with SessionLocal() as session:
+        job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one()
+        assert job.status == "submit_clicked"
 
 
 def test_worker_preview_handles_lever_form_and_flags_missing_answers(client, monkeypatch):
@@ -119,6 +164,98 @@ def test_worker_preview_handles_lever_form_and_flags_missing_answers(client, mon
     assert any(field["canonical_key"] == "linkedin" for field in worker_run["fields"])
     assert any(field["canonical_key"] == "start_date" for field in worker_run["review_items"])
     assert any(field["field_id"] == "question-why-role" for field in worker_run["review_items"])
+
+
+def test_worker_submit_handles_custom_choice_widgets(client):
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/custom-choice-fixture",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": custom_choice_fixture_html(),
+            "answer_overrides": [
+                {"field_id": "office-attendance", "value": "Yes"},
+                {"field_id": "visa-sponsorship", "value": "No"},
+            ],
+        },
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "submitted"
+    assert any(action["mode"] == "choose" for action in worker_run["actions"])
+    assert any(action["mode"] == "click" for action in worker_run["actions"])
+
+
+def test_worker_skips_submit_when_custom_choice_cannot_be_applied(client):
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/custom-choice-fixture-fail",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": custom_choice_fixture_html(),
+            "answer_overrides": [
+                {"field_id": "office-attendance", "value": "Maybe"},
+                {"field_id": "visa-sponsorship", "value": "No"},
+            ],
+        },
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "ready_for_submit"
+    assert any("skipped final submit" in log.lower() for log in worker_run["logs"])
+
+
+def test_worker_preview_extracts_react_select_combobox_as_structured_choice(client):
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/react-select-fixture",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={"dry_run": True, "fixture_html": react_select_fixture_html()},
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    attendance_field = next(
+        field for field in worker_run["fields"] if field["field_id"] == "question-1"
+    )
+
+    assert attendance_field["field_type"] == "select"
+    assert attendance_field["input_type"] == "combobox"
+    assert [option["label"] for option in attendance_field["options"]] == ["Yes", "No"]
+    assert not any(
+        field["question_text"] == "Select..." and not field["label"]
+        for field in worker_run["fields"]
+    )
 
 
 def seed_profile(client) -> None:
@@ -190,3 +327,137 @@ def create_job(*, source: str, url: str) -> int:
         session.commit()
         session.refresh(job)
         return job.id
+
+
+def custom_choice_fixture_html() -> str:
+    return """
+    <html>
+      <body>
+        <form onsubmit="event.preventDefault(); document.body.dataset.submitted = 'true';">
+          <label id="attendance-label">Are you open to working in-person in one of our offices 25% of the time?</label>
+          <button
+            id="office-attendance"
+            type="button"
+            role="combobox"
+            aria-controls="attendance-list"
+            aria-labelledby="attendance-label office-attendance"
+          >
+            Select...
+          </button>
+          <ul id="attendance-list" role="listbox" hidden>
+            <li role="option" data-value="yes">Yes</li>
+            <li role="option" data-value="no">No</li>
+          </ul>
+
+          <div id="visa-sponsorship" role="radiogroup" aria-label="Do you require visa sponsorship?">
+            <button type="button" role="radio" data-value="yes">Yes</button>
+            <button type="button" role="radio" data-value="no">No</button>
+          </div>
+
+          <button type="submit">Submit Application</button>
+        </form>
+
+        <script>
+          const attendanceButton = document.getElementById('office-attendance')
+          const attendanceList = document.getElementById('attendance-list')
+          attendanceButton.addEventListener('click', () => {
+            attendanceList.hidden = false
+          })
+          for (const option of attendanceList.querySelectorAll('[role="option"]')) {
+            option.addEventListener('click', () => {
+              attendanceButton.textContent = option.textContent
+              attendanceButton.dataset.value = option.dataset.value
+              attendanceList.hidden = true
+            })
+          }
+
+          for (const radio of document.querySelectorAll('[role="radio"]')) {
+            radio.addEventListener('click', () => {
+              for (const candidate of document.querySelectorAll('[role="radio"]')) {
+                candidate.setAttribute('aria-checked', candidate === radio ? 'true' : 'false')
+              }
+            })
+          }
+        </script>
+      </body>
+    </html>
+    """
+
+
+def confirmed_greenhouse_submit_fixture_html() -> str:
+    base_fixture = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
+    return base_fixture.replace(
+        "<form>",
+        (
+            "<form onsubmit=\"event.preventDefault(); "
+            "document.body.innerHTML = '<main><h1>Thank you for applying</h1>"
+            "<p>Your application has been submitted.</p></main>'; "
+            "history.replaceState({}, '', '/applications/complete');\">"
+        ),
+        1,
+    )
+
+
+def unconfirmed_greenhouse_submit_fixture_html() -> str:
+    base_fixture = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
+    return base_fixture.replace(
+        "<form>",
+        "<form onsubmit=\"event.preventDefault(); document.body.dataset.submitAttempted = 'true';\">",
+        1,
+    )
+
+
+def react_select_fixture_html() -> str:
+    return """
+    <html>
+      <body>
+        <form>
+          <label id="question_1-label" for="question_1">
+            Are you open to working in-person in one of our offices 25% of the time?
+          </label>
+          <div class="select__value-container">
+            <div class="select__placeholder" id="react-select-question_1-placeholder">Select...</div>
+            <div class="select__input-container" data-value="">
+              <input
+                id="question_1"
+                type="text"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded="false"
+                aria-haspopup="true"
+                aria-labelledby="question_1-label"
+                aria-describedby="react-select-question_1-placeholder"
+                aria-required="true"
+              />
+            </div>
+          </div>
+
+          <div class="shadow-wrapper">
+            <input type="text" role="combobox" aria-expanded="false" aria-haspopup="true" value="" />
+          </div>
+
+          <script>
+            const input = document.getElementById('question_1')
+            input.addEventListener('click', () => {
+              input.setAttribute('aria-expanded', 'true')
+              if (document.getElementById('react-select-question_1-listbox')) return
+              const listbox = document.createElement('div')
+              listbox.id = 'react-select-question_1-listbox'
+              listbox.setAttribute('role', 'listbox')
+              const yes = document.createElement('div')
+              yes.id = 'react-select-question_1-option-0'
+              yes.setAttribute('role', 'option')
+              yes.textContent = 'Yes'
+              const no = document.createElement('div')
+              no.id = 'react-select-question_1-option-1'
+              no.setAttribute('role', 'option')
+              no.textContent = 'No'
+              listbox.appendChild(yes)
+              listbox.appendChild(no)
+              document.body.appendChild(listbox)
+            })
+          </script>
+        </form>
+      </body>
+    </html>
+    """
