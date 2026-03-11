@@ -5,9 +5,15 @@ from sqlalchemy.orm import Session
 
 from apps.api.app.config import settings
 from apps.api.app.models import ApplicationDraft, CandidateProfile, JobLead, ProfileSource, WorkerRun
-from apps.api.app.schemas import CandidateProfilePayload, ProfileSourcePayload
+from apps.api.app.schemas import (
+    CandidateProfilePayload,
+    ProfileSourcePayload,
+    ProfileUpdateRequest,
+    SearchPreferencesPayload,
+)
 from apps.api.app.services.matching import rank_job
 from apps.api.app.services.profile_sources.linkedin_profile import merge_profile_payloads
+from apps.api.app.services.search_preferences import normalize_search_preferences, seed_search_preferences
 
 
 def get_latest_profile(session: Session) -> CandidateProfile | None:
@@ -21,6 +27,14 @@ def get_profile_payload(profile: CandidateProfile | None) -> CandidateProfilePay
         return None
     payload = CandidateProfilePayload.model_validate(profile.merged_profile)
     return payload if _profile_has_content(payload) else None
+
+
+def get_search_preferences(profile: CandidateProfile | None) -> SearchPreferencesPayload:
+    if profile is None:
+        return seed_search_preferences(None)
+    if profile.search_preferences:
+        return normalize_search_preferences(profile.search_preferences)
+    return seed_search_preferences(get_profile_payload(profile))
 
 
 def save_profile_source(
@@ -51,7 +65,13 @@ def save_profile_source(
     profile.raw_cv_text = raw_text if source_type == "cv" else profile.raw_cv_text
     profile.merged_profile = merged_payload.model_dump(mode="json")
     profile.field_sources = field_sources
-    rerank_all_jobs(session, merged_payload)
+    if profile.search_preferences_customized and profile.search_preferences:
+        search_preferences = normalize_search_preferences(profile.search_preferences)
+    else:
+        search_preferences = seed_search_preferences(merged_payload)
+        profile.search_preferences_customized = False
+    profile.search_preferences = search_preferences.model_dump(mode="json")
+    rerank_all_jobs(session, merged_payload, search_preferences)
 
     source = ProfileSource(
         profile_id=profile.id,
@@ -67,7 +87,7 @@ def save_profile_source(
     return profile
 
 
-def update_profile_manually(session: Session, payload: CandidateProfilePayload) -> CandidateProfile:
+def update_profile_manually(session: Session, payload: ProfileUpdateRequest) -> CandidateProfile:
     profile = get_latest_profile(session)
     if profile is None:
         profile = CandidateProfile(source_of_truth="manual")
@@ -80,9 +100,38 @@ def update_profile_manually(session: Session, payload: CandidateProfilePayload) 
     profile.phone = payload.phone
     profile.location = payload.location
     profile.source_of_truth = "manual"
-    profile.merged_profile = payload.model_dump(mode="json")
-    profile.field_sources = {field: "manual" for field in payload.model_dump(mode="json").keys()}
-    rerank_all_jobs(session, payload)
+    merged_profile = payload.model_dump(mode="json", exclude={"search_preferences"})
+    profile.merged_profile = merged_profile
+    profile.field_sources = {field: "manual" for field in merged_profile.keys()}
+    if payload.search_preferences is not None:
+        search_preferences = normalize_search_preferences(payload.search_preferences)
+        profile.search_preferences_customized = True
+    elif profile.search_preferences_customized and profile.search_preferences:
+        search_preferences = normalize_search_preferences(profile.search_preferences)
+    else:
+        search_preferences = seed_search_preferences(payload)
+        profile.search_preferences_customized = False
+    profile.search_preferences = search_preferences.model_dump(mode="json")
+    rerank_all_jobs(session, payload, search_preferences)
+    session.commit()
+    session.refresh(profile)
+    return profile
+
+
+def update_search_preferences(
+    session: Session, payload: SearchPreferencesPayload
+) -> CandidateProfile:
+    profile = get_latest_profile(session)
+    if profile is None:
+        profile = CandidateProfile(
+            source_of_truth="manual",
+            merged_profile=CandidateProfilePayload().model_dump(mode="json"),
+            field_sources={},
+        )
+        session.add(profile)
+        session.flush()
+    profile.search_preferences = normalize_search_preferences(payload).model_dump(mode="json")
+    profile.search_preferences_customized = True
     session.commit()
     session.refresh(profile)
     return profile
@@ -151,6 +200,10 @@ def upsert_job_lead(session: Session, payload: dict) -> JobLead:
             JobLead.source == payload["source"], JobLead.external_id == str(payload["external_id"])
         )
     ).scalar_one_or_none()
+    if existing is None and payload.get("url"):
+        existing = session.execute(
+            select(JobLead).where(JobLead.source == payload["source"], JobLead.url == payload["url"])
+        ).scalar_one_or_none()
     if existing:
         for field_name, value in payload.items():
             setattr(existing, field_name, value)
@@ -242,10 +295,15 @@ def delete_worker_run(session: Session, run_id: int) -> dict[str, int] | None:
     return {}
 
 
-def rerank_all_jobs(session: Session, profile_payload: CandidateProfilePayload) -> None:
+def rerank_all_jobs(
+    session: Session,
+    profile_payload: CandidateProfilePayload,
+    search_preferences: SearchPreferencesPayload | None = None,
+) -> None:
+    ranking_preferences = search_preferences or seed_search_preferences(profile_payload)
     jobs = session.execute(select(JobLead)).scalars().all()
     for job in jobs:
-        ranking = rank_job(profile_payload, _job_to_payload(job))
+        ranking = rank_job(profile_payload, _job_to_payload(job), ranking_preferences)
         job.score = ranking.score
         job.score_details = ranking.model_dump(mode="json")
 
@@ -296,7 +354,13 @@ def _rebuild_profile_after_source_delete(
             merged_profile = merged_profile.model_copy(update={"links": merged_links})
             profile.merged_profile = merged_profile.model_dump(mode="json")
         profile.raw_cv_text = latest_cv_source.raw_text if latest_cv_source else None
-        rerank_all_jobs(session, merged_profile)
+        if profile.search_preferences_customized and profile.search_preferences:
+            search_preferences = normalize_search_preferences(profile.search_preferences)
+        else:
+            search_preferences = seed_search_preferences(merged_profile)
+            profile.search_preferences_customized = False
+        profile.search_preferences = search_preferences.model_dump(mode="json")
+        rerank_all_jobs(session, merged_profile, search_preferences)
         return
 
     cv_payload = _payload_from_source(latest_cv_source)
@@ -312,7 +376,13 @@ def _rebuild_profile_after_source_delete(
     profile.source_of_truth = "cv" if latest_cv_source else "linkedin" if latest_linkedin_source else "manual"
     profile.merged_profile = merged_payload.model_dump(mode="json")
     profile.field_sources = field_sources
-    rerank_all_jobs(session, merged_payload)
+    if profile.search_preferences_customized and profile.search_preferences:
+        search_preferences = normalize_search_preferences(profile.search_preferences)
+    else:
+        search_preferences = seed_search_preferences(merged_payload)
+        profile.search_preferences_customized = False
+    profile.search_preferences = search_preferences.model_dump(mode="json")
+    rerank_all_jobs(session, merged_payload, search_preferences)
 
 
 def _latest_profile_source(

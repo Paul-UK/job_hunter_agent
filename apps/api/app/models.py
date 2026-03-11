@@ -31,6 +31,8 @@ class CandidateProfile(Base):
     raw_cv_text: Mapped[str | None] = mapped_column(Text)
     merged_profile: Mapped[dict] = mapped_column(JSON, default=dict)
     field_sources: Mapped[dict] = mapped_column(JSON, default=dict)
+    search_preferences: Mapped[dict] = mapped_column(JSON, default=dict)
+    search_preferences_customized: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -70,6 +72,7 @@ class JobLead(Base):
     description: Mapped[str] = mapped_column(Text)
     requirements: Mapped[list] = mapped_column(JSON, default=list)
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    discovery_method: Mapped[str] = mapped_column(String(32), default="direct")
     score: Mapped[float | None] = mapped_column(Float)
     score_details: Mapped[dict] = mapped_column(JSON, default=dict)
     research: Mapped[dict] = mapped_column(JSON, default=dict)

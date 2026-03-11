@@ -31,6 +31,8 @@ def test_cv_and_linkedin_merge_into_profile(client):
     assert profile["full_name"] == "Paul Example"
     assert "Python" in profile["merged_profile"]["skills"]
     assert profile["merged_profile"]["links"]["resume_path"].endswith("latest_resume.txt")
+    assert "AI Product Engineer" in profile["search_preferences"]["target_titles"]
+    assert "Python" in profile["search_preferences"]["include_keywords"]
 
     linkedin_text = """
     Paul Example
@@ -53,6 +55,8 @@ def test_cv_and_linkedin_merge_into_profile(client):
     assert dashboard_response.status_code == 200
     dashboard = dashboard_response.json()
     assert len(dashboard["profile_sources"]) == 2
+    assert dashboard["profile"]["search_preferences"]["target_titles"]
+    assert "Paris, France" in dashboard["profile"]["search_preferences"]["locations"]
 
 
 def test_delete_cv_source_removes_resume_and_keeps_remaining_linkedin_profile(client):
@@ -157,3 +161,55 @@ def test_manual_profile_update_reranks_existing_jobs(client):
 
     assert reranked_job["title"] == "Product Support Specialist"
     assert reranked_job["score"] < initial_score
+
+
+def test_manual_profile_update_persists_custom_search_preferences(client):
+    initial_profile = {
+        "full_name": "Paul Example",
+        "headline": "ML Support Engineering Leader",
+        "email": "paul@example.com",
+        "phone": None,
+        "location": "London, UK",
+        "summary": "Support engineering leader for AI products.",
+        "skills": ["Python", "SQL", "AWS"],
+        "achievements": [],
+        "experiences": [],
+        "education": [],
+        "links": {},
+        "search_preferences": {
+            "target_titles": ["AI Support Engineer", "Customer Engineer"],
+            "target_responsibilities": ["Lead high-severity customer escalations"],
+            "locations": ["London, UK"],
+            "workplace_modes": ["hybrid"],
+            "include_keywords": ["Python", "incident management"],
+            "exclude_keywords": ["sales"],
+            "companies_include": ["Anthropic"],
+            "companies_exclude": ["Meta"],
+            "result_limit": 7,
+        },
+    }
+
+    response = client.put("/api/profile", json=initial_profile)
+    assert response.status_code == 200
+    profile = response.json()
+    assert profile["search_preferences"]["target_titles"] == [
+        "AI Support Engineer",
+        "Customer Engineer",
+    ]
+    assert profile["search_preferences"]["exclude_keywords"] == ["sales"]
+
+    follow_up_response = client.put(
+        "/api/profile",
+        json={
+            **initial_profile,
+            "headline": "Principal Support Engineer",
+            "summary": "Support engineering leader focused on AI infrastructure.",
+        },
+    )
+    assert follow_up_response.status_code == 200
+    follow_up_profile = follow_up_response.json()
+    assert follow_up_profile["search_preferences"]["target_titles"] == [
+        "AI Support Engineer",
+        "Customer Engineer",
+    ]
+    assert follow_up_profile["search_preferences"]["result_limit"] == 7

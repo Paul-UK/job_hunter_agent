@@ -33,6 +33,18 @@ class CandidateProfilePayload(BaseModel):
     links: dict[str, str] = Field(default_factory=dict)
 
 
+class SearchPreferencesPayload(BaseModel):
+    target_titles: list[str] = Field(default_factory=list)
+    target_responsibilities: list[str] = Field(default_factory=list)
+    locations: list[str] = Field(default_factory=list)
+    workplace_modes: list[Literal["remote", "hybrid", "on-site"]] = Field(default_factory=list)
+    include_keywords: list[str] = Field(default_factory=list)
+    exclude_keywords: list[str] = Field(default_factory=list)
+    companies_include: list[str] = Field(default_factory=list)
+    companies_exclude: list[str] = Field(default_factory=list)
+    result_limit: int = Field(default=10, ge=1, le=25)
+
+
 class ProfileSourcePayload(BaseModel):
     id: int | None = None
     source_type: Literal["cv", "linkedin"]
@@ -53,15 +65,20 @@ class CandidateProfileResponse(BaseModel):
     source_of_truth: str
     merged_profile: dict[str, Any]
     field_sources: dict[str, Any]
+    search_preferences: SearchPreferencesPayload = Field(default_factory=SearchPreferencesPayload)
 
 
 class ProfileUpdateRequest(CandidateProfilePayload):
-    pass
+    search_preferences: SearchPreferencesPayload | None = None
 
 
 class JobDiscoveryRequest(BaseModel):
     identifiers: list[str] = Field(default_factory=list)
     include_questions: bool = False
+
+
+class WebJobDiscoveryRequest(BaseModel):
+    search_preferences: SearchPreferencesPayload
 
 
 class JobLeadBulkDeleteRequest(BaseModel):
@@ -82,6 +99,7 @@ class JobLeadResponse(BaseModel):
 
     id: int
     source: str
+    discovery_method: str = "direct"
     company: str
     title: str
     location: str | None = None
@@ -94,6 +112,14 @@ class JobLeadResponse(BaseModel):
     metadata_json: dict[str, Any] = Field(default_factory=dict)
     score_details: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
+
+
+class WebJobDiscoveryResponse(BaseModel):
+    jobs: list[JobLeadResponse] = Field(default_factory=list)
+    search_preferences: SearchPreferencesPayload = Field(default_factory=SearchPreferencesPayload)
+    search_queries: list[str] = Field(default_factory=list)
+    source_urls: list[str] = Field(default_factory=list)
+    grounded_pages_count: int = 0
 
 
 class RankingResult(BaseModel):
@@ -236,7 +262,7 @@ class WorkerPreviewSummary(BaseModel):
 
 class WorkerRunRequest(BaseModel):
     target_url: HttpUrl
-    platform: Literal["greenhouse", "lever", "generic"] = "generic"
+    platform: Literal["greenhouse", "lever", "ashbyhq", "generic"] = "generic"
     profile: CandidateProfilePayload
     job: JobLeadWorkerPayload
     draft: ApplicationDraftWorkerPayload

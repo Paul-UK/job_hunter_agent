@@ -254,9 +254,10 @@
 
 .status-nav-item {
   width: 100%;
-  display: grid;
-  justify-items: start;
-  align-items: start;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  align-items: flex-start;
   gap: 0.28rem;
   padding: 0.95rem 1rem;
   border-radius: 18px;
@@ -465,16 +466,50 @@ button:disabled {
 
 .panel-header {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: flex-start;
   gap: 1rem;
   padding: 1.3rem 1.45rem 1rem;
   border-bottom: 1px solid var(--border);
 }
 
+.panel-header > .count-badge {
+  margin-left: auto;
+}
+
+.panel-header-toggle {
+  cursor: pointer;
+  user-select: none;
+  transition: background 160ms ease;
+}
+
+.panel-header-toggle:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.panel-header-toggle:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
 .panel-title-group {
   display: grid;
   gap: 0.3rem;
+  min-width: 0;
+  flex: 1 1 32rem;
+}
+
+.panel-title-group-shortlist {
+  flex-basis: 28rem;
+  max-width: min(100%, 28rem);
+}
+
+.panel-header-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  margin-left: auto;
 }
 
 .panel-kicker {
@@ -497,24 +532,60 @@ button:disabled {
   padding: 1.15rem 1.45rem 1.45rem;
 }
 
+.collapse-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--text-subtle);
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.collapse-indicator::before {
+  content: '';
+  width: 0.55rem;
+  height: 0.55rem;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+  transition: transform 160ms ease;
+  margin-top: -0.12rem;
+}
+
+.panel-header-toggle[aria-expanded='false'] .collapse-indicator::before {
+  transform: rotate(-45deg);
+  margin-top: 0;
+}
+
 .shortlist-toolbar {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
   gap: 1rem;
   margin-bottom: 1.15rem;
 }
 
 .filter-grid {
-  flex: 1;
   display: grid;
+  align-items: start;
   gap: 1rem;
-  grid-template-columns: minmax(160px, 220px) minmax(180px, 240px) minmax(0, 1fr);
+  grid-template-columns:
+    minmax(140px, 0.85fr)
+    minmax(170px, 1fr)
+    minmax(180px, 1fr)
+    minmax(260px, 1.3fr);
+}
+
+.shortlist-workplace-field {
+  min-width: 0;
 }
 
 .filter-pill-row {
   display: flex;
   flex-wrap: wrap;
   gap: 0.5rem;
+  align-items: flex-start;
 }
 
 .filter-pill {
@@ -548,7 +619,7 @@ button:disabled {
   display: flex;
   flex-wrap: wrap;
   gap: 0.75rem;
-  align-self: flex-end;
+  justify-content: flex-end;
 }
 
 .panel-body-compact {
@@ -557,8 +628,35 @@ button:disabled {
 
 .header-actions {
   display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  align-items: center;
+  column-gap: 0.75rem;
+  row-gap: 0.75rem;
+  min-width: 0;
+  flex: 0 1 auto;
+  margin-left: auto;
+  max-width: 100%;
+}
+
+.header-badges,
+.header-controls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   align-items: center;
   gap: 0.75rem;
+  min-width: 0;
+}
+
+.header-badges {
+  flex: 0 1 auto;
+  max-width: 100%;
+}
+
+.header-controls {
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
 }
 
 .count-badge {
@@ -598,6 +696,11 @@ button:disabled {
 }
 
 .draft-card {
+  display: grid;
+  gap: 0.9rem;
+}
+
+.draft-card-body {
   display: grid;
   gap: 0.9rem;
 }
@@ -890,6 +993,11 @@ button:disabled {
   gap: 0.85rem;
 }
 
+.worker-results-body {
+  display: grid;
+  gap: 0.85rem;
+}
+
 .worker-meta-grid {
   display: grid;
   gap: 0.55rem 1rem;
@@ -1071,6 +1179,9 @@ button:disabled {
   .button-row,
   .brand-lockup,
   .header-actions,
+  .header-badges,
+  .header-controls,
+  .panel-header-meta,
   .shortlist-toolbar,
   .draft-card-header,
   .review-card-header {
@@ -1083,6 +1194,10 @@ button:disabled {
     grid-template-columns: 1fr;
   }
 
+  .shortlist-workplace-field {
+    grid-column: auto;
+  }
+
   .job-score-card {
     justify-items: flex-start;
   }
@@ -1093,5 +1208,15 @@ button:disabled {
 
   .status-panel {
     position: static;
+  }
+}
+
+@media (max-width: 1180px) and (min-width: 981px) {
+  .filter-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .shortlist-workplace-field {
+    grid-column: 1 / -1;
   }
 }

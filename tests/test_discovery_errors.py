@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 
 from apps.api.app.routers import jobs as jobs_router
+from apps.api.app.services.job_discovery import WebDiscoveryError
 
 
 def test_greenhouse_invalid_board_returns_client_error(client, monkeypatch):
@@ -91,3 +92,70 @@ def test_greenhouse_partial_success_skips_invalid_identifier(client, monkeypatch
     payload = api_response.json()
     assert len(payload) == 1
     assert payload[0]["company"] == "Good Board"
+
+
+def test_web_discovery_requires_profile_context(client):
+    api_response = client.post(
+        "/api/jobs/discover/web",
+        json={
+            "search_preferences": {
+                "target_titles": ["AI Engineer"],
+                "target_responsibilities": [],
+                "locations": ["London, UK"],
+                "workplace_modes": [],
+                "include_keywords": ["Python"],
+                "exclude_keywords": [],
+                "companies_include": [],
+                "companies_exclude": [],
+                "result_limit": 5,
+            }
+        },
+    )
+
+    assert api_response.status_code == 400
+    assert "profile" in api_response.json()["detail"].lower()
+
+
+def test_web_discovery_surfaces_grounded_search_failures(client, monkeypatch):
+    profile_response = client.put(
+        "/api/profile",
+        json={
+            "full_name": "Paul Example",
+            "headline": "AI Engineer",
+            "email": "paul@example.com",
+            "phone": None,
+            "location": "London, UK",
+            "summary": "Python engineer building AI systems.",
+            "skills": ["Python", "FastAPI"],
+            "achievements": [],
+            "experiences": [],
+            "education": [],
+            "links": {},
+        },
+    )
+    assert profile_response.status_code == 200
+
+    def raise_failure(**_kwargs):
+        raise WebDiscoveryError("Gemini grounded search failed: upstream timeout")
+
+    monkeypatch.setattr(jobs_router, "discover_jobs_from_web", raise_failure)
+
+    api_response = client.post(
+        "/api/jobs/discover/web",
+        json={
+            "search_preferences": {
+                "target_titles": ["AI Engineer"],
+                "target_responsibilities": ["Build AI systems"],
+                "locations": ["London, UK"],
+                "workplace_modes": [],
+                "include_keywords": ["Python"],
+                "exclude_keywords": [],
+                "companies_include": [],
+                "companies_exclude": [],
+                "result_limit": 5,
+            }
+        },
+    )
+
+    assert api_response.status_code == 503
+    assert "grounded search failed" in api_response.json()["detail"].lower()

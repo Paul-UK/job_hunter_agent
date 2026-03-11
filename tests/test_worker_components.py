@@ -18,6 +18,7 @@ from apps.worker.answer_resolver import build_preview_summary, resolve_fields
 from apps.worker.field_classifier import classify_field
 from apps.worker.form_extractor import extract_form_fields
 from apps.worker.main import _resolve_selector
+from apps.worker.platform_adapters import detect_platform
 
 
 class FakeLLMClient:
@@ -51,6 +52,13 @@ def test_extract_form_fields_reads_greenhouse_fixture():
     assert "question-why-anthropic" in field_ids
     assert any(field.field_type == "select" for field in fields)
     assert any(field.field_type == "textarea" for field in fields)
+
+
+def test_detect_platform_recognizes_ashbyhq_urls():
+    assert (
+        detect_platform("https://jobs.ashbyhq.com/Ashby/1234-support-engineer/application", "generic")
+        == "ashbyhq"
+    )
 
 
 def test_extract_form_fields_prefers_structural_selector_attributes():
@@ -126,6 +134,54 @@ def test_extract_form_fields_reads_custom_combobox_and_radiogroup():
     assert visa_field.field_type == "radio"
     assert visa_field.input_type == "radiogroup"
     assert [option.value for option in visa_field.options] == ["yes", "no"]
+
+
+def test_extract_form_fields_reads_hidden_native_radio_fieldset():
+    fixture_html = """
+    <form>
+      <fieldset>
+        <label class="question-title" for="hear-about-elevenlabs">
+          How did you hear about ElevenLabs?
+        </label>
+        <div>
+          <span><input type="radio" id="hear-about-user" name="hear-about" required style="position:absolute; opacity:0; width:0; height:0;" /></span>
+          <label for="hear-about-user">I'm a user</label>
+        </div>
+        <div>
+          <span><input type="radio" id="hear-about-news" name="hear-about" style="position:absolute; opacity:0; width:0; height:0;" /></span>
+          <label for="hear-about-news">News article</label>
+        </div>
+        <div>
+          <span><input type="radio" id="hear-about-other" name="hear-about" style="position:absolute; opacity:0; width:0; height:0;" /></span>
+          <label for="hear-about-other">Other (please specify)</label>
+        </div>
+      </fieldset>
+      <label for="hear-about-detail">If other, please specify below</label>
+      <input id="hear-about-detail" name="hear-about-detail" placeholder="Type here..." />
+    </form>
+    """
+
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_content(fixture_html, wait_until="load")
+        fields = extract_form_fields(page)
+        browser.close()
+
+    source_field = next(
+        field
+        for field in fields
+        if field.label == "How did you hear about ElevenLabs?"
+    )
+
+    assert source_field.field_type == "radio"
+    assert source_field.input_type == "radiogroup"
+    assert [option.label for option in source_field.options] == [
+        "I'm a user",
+        "News article",
+        "Other (please specify)",
+    ]
+    assert source_field.options[0].selector == 'label[for="hear-about-user"]'
 
 
 def test_extract_form_fields_reads_react_select_input_combobox_and_skips_shadow_placeholder():
@@ -241,6 +297,35 @@ def test_classify_field_maps_email_from_realistic_metadata():
     assert classified.canonical_key == "email"
     assert classified.classification_source == "heuristic"
     assert classified.classification_confidence >= 0.9
+
+
+def test_classify_field_does_not_map_choice_question_from_option_labels():
+    field = WorkerFieldState(
+        field_id="hear-about-elevenlabs",
+        label="How did you hear about ElevenLabs?",
+        question_text=(
+            "How did you hear about ElevenLabs? "
+            "I'm a user News article Job board Social media (LinkedIn, Instagram, X etc)"
+        ),
+        selector="#hear-about-elevenlabs",
+        field_type="radio",
+        input_type="radiogroup",
+        required=True,
+        options=[
+            WorkerFieldOption(label="I'm a user", value="I'm a user"),
+            WorkerFieldOption(label="News article", value="News article"),
+            WorkerFieldOption(label="Job board", value="Job board"),
+            WorkerFieldOption(
+                label="Social media (LinkedIn, Instagram, X etc)",
+                value="Social media (LinkedIn, Instagram, X etc)",
+            ),
+        ],
+    )
+
+    classified = classify_field(field, "ashbyhq", DisabledLLMClient())
+
+    assert classified.canonical_key == "custom_question"
+    assert classified.classification_source == "fallback"
 
 
 def test_classify_field_detects_phone_country_code_combobox():

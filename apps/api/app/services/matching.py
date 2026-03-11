@@ -4,7 +4,7 @@ import re
 
 from rapidfuzz import fuzz
 
-from apps.api.app.schemas import CandidateProfilePayload, RankingResult
+from apps.api.app.schemas import CandidateProfilePayload, RankingResult, SearchPreferencesPayload
 
 TITLE_NORMALIZATIONS = {
     "ml": "machine learning",
@@ -255,7 +255,12 @@ COMPATIBLE_LOCATION_GROUPS = {
 }
 
 
-def rank_job(profile: CandidateProfilePayload, job: dict) -> RankingResult:
+def rank_job(
+    profile: CandidateProfilePayload,
+    job: dict,
+    search_preferences: SearchPreferencesPayload | None = None,
+) -> RankingResult:
+    intent = search_preferences or SearchPreferencesPayload()
     job_title = job.get("title", "")
     job_text = " ".join(
         part
@@ -268,12 +273,15 @@ def rank_job(profile: CandidateProfilePayload, job: dict) -> RankingResult:
         if part
     )
     job_text_lower = job_text.lower()
+    normalized_job_text = _normalize_text(job_text)
 
     matched_skills = [skill for skill in profile.skills if skill.lower() in job_text_lower]
-    title_score, title_matches, title_warnings = _title_alignment(profile, job_title)
+    title_score, title_matches, title_warnings = _title_alignment(profile, job_title, intent)
     scope_score, scope_matches, scope_warnings = _scope_alignment(profile, job_title)
+    intent_score, intent_matches = _intent_alignment(intent, normalized_job_text, job_text_lower)
+    exclusion_warnings = _excluded_term_warnings(intent, normalized_job_text, job_text_lower)
     location_score, location_matches, location_warnings = _location_alignment(
-        profile.location,
+        _preferred_location_text(profile, intent),
         job,
     )
     summary_match = fuzz.token_set_ratio((profile.summary or "").lower(), job_text_lower)
@@ -286,13 +294,15 @@ def rank_job(profile: CandidateProfilePayload, job: dict) -> RankingResult:
                 title_score
                 + scope_score
                 + skill_score
+                + intent_score
+                - (len(exclusion_warnings) * 12.0)
                 + (summary_match * 0.08)
                 + location_score,
             ),
             2,
         ),
     )
-    score = _apply_fit_caps(score, title_warnings, location_warnings)
+    score = _apply_fit_caps(score, title_warnings, location_warnings, exclusion_warnings)
 
     missing_skill_signals = [
         signal
@@ -300,10 +310,16 @@ def rank_job(profile: CandidateProfilePayload, job: dict) -> RankingResult:
         if signal not in {skill.lower() for skill in profile.skills}
     ][:6]
     missing_signals = _dedupe(
-        [*location_warnings, *title_warnings, *scope_warnings, *missing_skill_signals]
+        [
+            *location_warnings,
+            *title_warnings,
+            *scope_warnings,
+            *exclusion_warnings,
+            *missing_skill_signals,
+        ]
     )[:6]
     matched_signals = _dedupe(
-        [*title_matches, *scope_matches, *location_matches, *matched_skills]
+        [*title_matches, *scope_matches, *location_matches, *intent_matches, *matched_skills]
     )[:6]
     summary = _build_summary(
         score,
@@ -311,6 +327,7 @@ def rank_job(profile: CandidateProfilePayload, job: dict) -> RankingResult:
         title_warnings,
         scope_warnings,
         location_warnings,
+        exclusion_warnings,
         missing_skill_signals,
     )
     return RankingResult(
@@ -328,10 +345,13 @@ def _build_summary(
     title_warnings: list[str],
     scope_warnings: list[str],
     location_warnings: list[str],
+    exclusion_warnings: list[str],
     missing_skills: list[str],
 ) -> str:
     if location_warnings:
         return "Skill overlap exists, but the role location looks weak for your current base."
+    if exclusion_warnings:
+        return "Relevant overlap exists, but the role conflicts with one of your exclusion terms."
     if title_warnings:
         return "Some skill overlap, but the job title does not align well with your recent roles."
     if scope_warnings:
@@ -356,8 +376,9 @@ def _build_summary(
 def _title_alignment(
     profile: CandidateProfilePayload,
     job_title: str,
+    search_preferences: SearchPreferencesPayload | None = None,
 ) -> tuple[float, list[str], list[str]]:
-    candidate_titles = _candidate_titles(profile)
+    candidate_titles = _candidate_titles(profile, search_preferences)
     if not candidate_titles or not job_title:
         return 0.0, [], []
 
@@ -503,10 +524,74 @@ def _extract_candidate_keywords(job_text: str) -> list[str]:
     return list(dict.fromkeys(matches))
 
 
-def _candidate_titles(profile: CandidateProfilePayload) -> list[str]:
+def _candidate_titles(
+    profile: CandidateProfilePayload,
+    search_preferences: SearchPreferencesPayload | None = None,
+) -> list[str]:
     titles = [profile.headline or ""]
     titles.extend(experience.title or "" for experience in profile.experiences)
+    if search_preferences is not None:
+        titles.extend(search_preferences.target_titles)
     return _dedupe([title for title in titles if title.strip()])
+
+
+def _preferred_location_text(
+    profile: CandidateProfilePayload,
+    search_preferences: SearchPreferencesPayload,
+) -> str | None:
+    if search_preferences.locations:
+        return " ".join(search_preferences.locations)
+    return profile.location
+
+
+def _intent_alignment(
+    search_preferences: SearchPreferencesPayload,
+    normalized_job_text: str,
+    job_text_lower: str,
+) -> tuple[float, list[str]]:
+    if not search_preferences.target_responsibilities and not search_preferences.include_keywords:
+        return 0.0, []
+
+    matched_responsibilities = [
+        responsibility
+        for responsibility in search_preferences.target_responsibilities
+        if _matches_intent_phrase(normalized_job_text, responsibility)
+    ]
+    matched_keywords = [
+        keyword for keyword in search_preferences.include_keywords if keyword.lower() in job_text_lower
+    ]
+    score = min(14.0, len(matched_responsibilities) * 4.0) + min(8.0, len(matched_keywords) * 2.0)
+    matches = [f"responsibility match: {responsibility}" for responsibility in matched_responsibilities[:2]]
+    matches.extend(f"target keyword: {keyword}" for keyword in matched_keywords[:2])
+    return score, _dedupe(matches)
+
+
+def _excluded_term_warnings(
+    search_preferences: SearchPreferencesPayload,
+    normalized_job_text: str,
+    job_text_lower: str,
+) -> list[str]:
+    warnings = []
+    for term in search_preferences.exclude_keywords:
+        normalized_term = _normalize_text(term)
+        if not normalized_term:
+            continue
+        if normalized_term in normalized_job_text or term.lower() in job_text_lower:
+            warnings.append(f"excluded term matched: {term}")
+    return _dedupe(warnings)
+
+
+def _matches_intent_phrase(normalized_job_text: str, phrase: str) -> bool:
+    normalized_phrase = _normalize_text(phrase)
+    if not normalized_phrase:
+        return False
+    if normalized_phrase in normalized_job_text:
+        return True
+    phrase_tokens = set(normalized_phrase.split())
+    job_tokens = set(normalized_job_text.split())
+    if len(phrase_tokens) >= 2 and len(phrase_tokens & job_tokens) >= min(3, len(phrase_tokens)):
+        return True
+    return fuzz.partial_ratio(normalized_phrase, normalized_job_text) >= 75
 
 
 def _candidate_scope_level(profile: CandidateProfilePayload) -> int | None:
@@ -709,6 +794,7 @@ def _apply_fit_caps(
     score: float,
     title_warnings: list[str],
     location_warnings: list[str],
+    exclusion_warnings: list[str],
 ) -> float:
     capped_score = score
     if location_warnings:
@@ -720,5 +806,8 @@ def _apply_fit_caps(
 
     if title_warnings:
         capped_score = min(capped_score, 55.0)
+
+    if exclusion_warnings:
+        capped_score = min(capped_score, 35.0)
 
     return round(capped_score, 2)

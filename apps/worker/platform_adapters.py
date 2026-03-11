@@ -102,6 +102,7 @@ FIELD_HINTS = {
         ],
         "cover_note": ["textarea[name='comments']", "textarea[aria-label*='cover' i]", "textarea"],
     },
+    "ashbyhq": {},
     "generic": {
         "first_name": ["input[name*='first']", "input[id*='first']"],
         "last_name": ["input[name*='last']", "input[id*='last']"],
@@ -136,6 +137,13 @@ SUBMIT_HINTS = {
         "button:has-text('Submit application')",
         "button:has-text('Submit')",
     ],
+    "ashbyhq": [
+        "button[type='submit']",
+        "input[type='submit']",
+        "button:has-text('Submit application')",
+        "button:has-text('Submit Application')",
+        "button:has-text('Submit')",
+    ],
     "generic": ["button[type='submit']", "input[type='submit']", "button:has-text('Submit')"],
 }
 
@@ -147,6 +155,8 @@ def detect_platform(target_url: str, platform_hint: str) -> str:
         return "greenhouse"
     if "lever.co" in target_url:
         return "lever"
+    if "ashbyhq.com" in target_url:
+        return "ashbyhq"
     return "generic"
 
 
