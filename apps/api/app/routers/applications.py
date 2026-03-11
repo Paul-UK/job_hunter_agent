@@ -210,7 +210,7 @@ def run_application(
     worker_request = WorkerRunRequest(
         application_draft_id=draft.id,
         target_url=job.url,
-        platform=job.source if job.source in {"greenhouse", "lever"} else "generic",
+        platform=job.source if job.source in {"greenhouse", "lever", "ashbyhq"} else "generic",
         profile=profile_payload,
         job=job_payload,
         draft=draft_payload,

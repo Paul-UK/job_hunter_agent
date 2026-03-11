@@ -155,7 +155,8 @@ def _heuristic_classification(field: WorkerFieldState) -> tuple[str, float, str]
     if _looks_like_phone_country_code(field):
         return "phone_country_code", 0.93, "Matched phone country code heuristic."
 
-    text = _field_text(field)
+    include_question_text = not (field.field_type in {"select", "radio", "checkbox"} and field.label)
+    text = _field_text(field, include_options=False, include_question_text=include_question_text)
     for canonical_key, patterns, confidence in HEURISTIC_PATTERNS:
         if any(re.search(pattern, text) for pattern in patterns):
             return canonical_key, confidence, f"Matched {canonical_key} heuristic."
@@ -189,18 +190,26 @@ def _looks_like_custom_question(field: WorkerFieldState) -> bool:
     return bool(re.search(r"\b(question|why|describe|explain|additional)\b", text))
 
 
-def _field_text(field: WorkerFieldState) -> str:
+def _field_text(
+    field: WorkerFieldState,
+    *,
+    include_options: bool = True,
+    include_question_text: bool = True,
+) -> str:
+    parts = [
+        field.label,
+        field.placeholder,
+        field.html_name or "",
+        field.html_id or "",
+        field.canonical_label or "",
+    ]
+    if include_question_text:
+        parts.insert(1, field.question_text)
+    if include_options:
+        parts.append(" ".join(option.label for option in field.options))
     return " ".join(
         _normalize(part)
-        for part in [
-            field.label,
-            field.question_text,
-            field.placeholder,
-            field.html_name or "",
-            field.html_id or "",
-            field.canonical_label or "",
-            " ".join(option.label for option in field.options),
-        ]
+        for part in parts
         if part
     ).strip()
 

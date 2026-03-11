@@ -7,7 +7,9 @@ import type {
   DashboardResponse,
   DeleteResponse,
   JobLeadResponse,
+  SearchPreferencesPayload,
   ScreeningAnswerPayload,
+  WebJobDiscoveryResponse,
   WorkerAnswerOverride,
   WorkerRunResponse,
 } from './types'
@@ -104,6 +106,22 @@ export function discoverLever(identifiers: string[]) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ identifiers }),
+  })
+}
+
+export function discoverAshby(identifiers: string[]) {
+  return request<JobLeadResponse[]>('/api/jobs/discover/ashby', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ identifiers }),
+  })
+}
+
+export function discoverWebJobs(search_preferences: SearchPreferencesPayload) {
+  return request<WebJobDiscoveryResponse>('/api/jobs/discover/web', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ search_preferences }),
   })
 }
 

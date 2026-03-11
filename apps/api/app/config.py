@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-2.5-flash"
     gemini_timeout_seconds: float = 20.0
+    gemini_discovery_model: str = "gemini-3-flash-preview"
+    gemini_discovery_timeout_seconds: float = 30.0
+    gemini_discovery_max_attempts: int = 3
 
     model_config = SettingsConfigDict(
         env_prefix="JOB_AGENT_",

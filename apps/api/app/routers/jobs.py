@@ -18,10 +18,14 @@ from apps.api.app.schemas import (
     JobLeadResponse,
     LinkedinLeadRequest,
     ResearchResponse,
+    WebJobDiscoveryRequest,
+    WebJobDiscoveryResponse,
 )
 from apps.api.app.services.company_research import research_company
 from apps.api.app.services.company_research import research_needs_refresh
 from apps.api.app.services.drafting import build_application_draft
+from apps.api.app.services.job_discovery import WebDiscoveryError, discover_jobs_from_web
+from apps.api.app.services.job_sources.ashby import fetch_ashby_jobs
 from apps.api.app.services.job_sources.greenhouse import fetch_greenhouse_jobs
 from apps.api.app.services.job_sources.lever import fetch_lever_jobs
 from apps.api.app.services.job_sources.linkedin import create_linkedin_lead
@@ -31,7 +35,9 @@ from apps.api.app.services.storage import (
     delete_job_leads,
     get_latest_profile,
     get_profile_payload,
+    get_search_preferences,
     list_jobs,
+    update_search_preferences,
     upsert_job_lead,
 )
 
@@ -88,6 +94,27 @@ def discover_lever_jobs(
     return discovered
 
 
+@router.post("/discover/ashby", response_model=list[JobLeadResponse])
+def discover_ashby_jobs(
+    payload: JobDiscoveryRequest,
+    session: Session = Depends(get_session),
+) -> list[JobLeadResponse]:
+    discovered: list[JobLead] = []
+    failures: list[tuple[int, str]] = []
+    for job_board_name in payload.identifiers:
+        try:
+            jobs = fetch_ashby_jobs(job_board_name)
+        except Exception as exc:
+            failures.append(_map_discovery_error("ashbyhq", job_board_name, exc))
+            continue
+
+        for job_payload in jobs:
+            discovered.append(_save_and_score_job(session, job_payload))
+
+    _raise_if_discovery_failed(failures, discovered)
+    return discovered
+
+
 @router.post("/discover/linkedin", response_model=JobLeadResponse)
 def discover_linkedin_job(
     payload: LinkedinLeadRequest,
@@ -95,6 +122,39 @@ def discover_linkedin_job(
 ) -> JobLeadResponse:
     job = _save_and_score_job(session, create_linkedin_lead(payload))
     return job
+
+
+@router.post("/discover/web", response_model=WebJobDiscoveryResponse)
+def discover_web_jobs(
+    payload: WebJobDiscoveryRequest,
+    session: Session = Depends(get_session),
+) -> WebJobDiscoveryResponse:
+    profile = get_latest_profile(session)
+    profile_payload = get_profile_payload(profile)
+    if profile is None or profile_payload is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Upload or review your profile before using AI web discovery.",
+        )
+
+    profile = update_search_preferences(session, payload.search_preferences)
+    search_preferences = get_search_preferences(profile)
+    try:
+        discovery_result = discover_jobs_from_web(
+            profile=profile_payload,
+            search_preferences=search_preferences,
+        )
+    except WebDiscoveryError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    discovered = [_save_and_score_job(session, job_payload) for job_payload in discovery_result.jobs]
+    return WebJobDiscoveryResponse(
+        jobs=discovered,
+        search_preferences=search_preferences,
+        search_queries=discovery_result.search_queries,
+        source_urls=discovery_result.source_urls,
+        grounded_pages_count=discovery_result.grounded_pages_count,
+    )
 
 
 @router.post("/{job_id}/research", response_model=ResearchResponse)
@@ -114,10 +174,11 @@ def draft_application(
     job = _get_job(session, job_id)
     profile = get_latest_profile(session)
     profile_payload = get_profile_payload(profile)
+    search_preferences = get_search_preferences(profile)
     if profile is None or profile_payload is None:
         raise HTTPException(status_code=400, detail="Upload a CV before drafting applications.")
 
-    ranking = rank_job(profile_payload, job_to_payload(job))
+    ranking = rank_job(profile_payload, job_to_payload(job), search_preferences)
     job.score = ranking.score
     job.score_details = ranking.model_dump(mode="json")
     if research_needs_refresh(job.research):
@@ -176,9 +237,10 @@ def remove_job(job_id: int, session: Session = Depends(get_session)) -> DeleteRe
 def _save_and_score_job(session: Session, payload: dict) -> JobLead:
     profile = get_latest_profile(session)
     profile_payload = get_profile_payload(profile)
+    search_preferences = get_search_preferences(profile)
     job = upsert_job_lead(session, payload)
     if profile_payload:
-        ranking = rank_job(profile_payload, payload)
+        ranking = rank_job(profile_payload, payload, search_preferences)
         job.score = ranking.score
         job.score_details = ranking.model_dump(mode="json")
         session.commit()
@@ -211,6 +273,7 @@ def job_to_payload(job: JobLead) -> dict:
 def _map_discovery_error(
     source: str, identifier: str, exc: Exception
 ) -> tuple[int, str]:
+    source_label = _source_display_name(source)
     if isinstance(exc, httpx.HTTPStatusError):
         status_code = exc.response.status_code
         if status_code == 404:
@@ -220,6 +283,12 @@ def _map_discovery_error(
                     f"Greenhouse board token '{identifier}' was not found. "
                     "Use the public board token from the company's Greenhouse URL.",
                 )
+            if source == "ashbyhq":
+                return (
+                    400,
+                    f"Ashby job board '{identifier}' was not found. "
+                    "Use the final path segment from jobs.ashbyhq.com/<job-board-name>.",
+                )
             return (
                 400,
                 f"Lever company slug '{identifier}' was not found. "
@@ -228,29 +297,29 @@ def _map_discovery_error(
         if status_code == 429:
             return (
                 503,
-                f"{source.title()} is rate limiting requests for '{identifier}'. "
+                f"{source_label} is rate limiting requests for '{identifier}'. "
                 "Try again shortly.",
             )
         if 500 <= status_code < 600:
             return (
                 502,
-                f"{source.title()} returned {status_code} while loading '{identifier}'.",
+                f"{source_label} returned {status_code} while loading '{identifier}'.",
             )
         return (
             502,
-            f"{source.title()} returned {status_code} for '{identifier}'.",
+            f"{source_label} returned {status_code} for '{identifier}'.",
         )
 
     if isinstance(exc, httpx.TimeoutException):
         return (
             504,
-            f"{source.title()} timed out while loading '{identifier}'. Try again in a moment.",
+            f"{source_label} timed out while loading '{identifier}'. Try again in a moment.",
         )
 
     if isinstance(exc, httpx.RequestError):
         return (
             502,
-            f"Could not reach {source.title()} while loading '{identifier}'.",
+            f"Could not reach {source_label} while loading '{identifier}'.",
         )
 
     logger.exception(
@@ -261,8 +330,14 @@ def _map_discovery_error(
     )
     return (
         500,
-        f"Unexpected {source.title()} discovery error for '{identifier}'.",
+        f"Unexpected {source_label} discovery error for '{identifier}'.",
     )
+
+
+def _source_display_name(source: str) -> str:
+    if source == "ashbyhq":
+        return "Ashby"
+    return source.title()
 
 
 def _raise_if_discovery_failed(

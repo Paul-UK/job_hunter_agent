@@ -12,6 +12,13 @@ engine = create_engine(settings.database_url, connect_args=connect_args, future=
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
 SQLITE_RUNTIME_COLUMNS = {
+    "candidate_profiles": {
+        "search_preferences": "JSON NOT NULL DEFAULT '{}'",
+        "search_preferences_customized": "BOOLEAN NOT NULL DEFAULT 0",
+    },
+    "job_leads": {
+        "discovery_method": "VARCHAR(32) NOT NULL DEFAULT 'direct'",
+    },
     "worker_runs": {
         "fields": "JSON NOT NULL DEFAULT '[]'",
         "review_items": "JSON NOT NULL DEFAULT '[]'",

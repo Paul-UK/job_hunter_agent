@@ -55,6 +55,12 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
             if (element.id) {
               push(`#${CSS.escape(element.id)}`)
             }
+            if (tag === 'label') {
+              const htmlFor = attr(element, 'for')
+              if (htmlFor) {
+                push(`label[for="${quote(htmlFor)}"]`)
+              }
+            }
             const dataTestId = attr(element, 'data-testid')
             if (dataTestId) {
               push(`${tag}[data-testid="${quote(dataTestId)}"]`)
@@ -90,9 +96,33 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
             push(`xpath=${xpathForElement(element)}`)
             return candidates
           }
+          const mergeSelectorCandidates = (...candidateGroups) => {
+            const merged = []
+            for (const candidateGroup of candidateGroups) {
+              for (const candidate of candidateGroup || []) {
+                if (candidate && !merged.includes(candidate)) {
+                  merged.push(candidate)
+                }
+              }
+            }
+            return merged
+          }
           const selectorFor = (element) => {
             const selectors = selectorCandidatesFor(element)
             return selectors[0] || `xpath=${xpathForElement(element)}`
+          }
+          const associatedChoiceLabel = (element) => {
+            const labels = element.labels ? Array.from(element.labels) : []
+            if (labels.length) {
+              return labels[0]
+            }
+            if (element.id) {
+              const explicitLabel = document.querySelector(`label[for="${CSS.escape(element.id)}"]`)
+              if (explicitLabel) {
+                return explicitLabel
+              }
+            }
+            return element.closest('label')
           }
           const labelText = (element) => {
             const associatedLabels = element.labels ? Array.from(element.labels) : []
@@ -138,6 +168,59 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
             const heading = sectionRoot.querySelector('legend, h1, h2, h3, h4, h5, h6')
             return text(heading)
           }
+          const choiceGroupHeadingElement = (container, optionLabels = []) => {
+            if (!container) {
+              return null
+            }
+            const optionLabelSet = new Set(
+              optionLabels.map((value) => compress(value).toLowerCase()).filter(Boolean)
+            )
+            const directHeading = Array.from(container.children || []).find((child) => {
+              if (!isVisible(child)) {
+                return false
+              }
+              const tag = child.tagName.toLowerCase()
+              if (!['legend', 'label', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p'].includes(tag)) {
+                return false
+              }
+              const candidateText = text(child)
+              return Boolean(candidateText) && !optionLabelSet.has(candidateText.toLowerCase())
+            })
+            if (directHeading) {
+              return directHeading
+            }
+            const labelledBy = attr(container, 'aria-labelledby')
+            if (labelledBy) {
+              const labelledByElements = labelledBy
+                .split(' ')
+                .map((id) => document.getElementById(id))
+                .filter(Boolean)
+              if (labelledByElements.length) {
+                return labelledByElements[0]
+              }
+            }
+            return null
+          }
+          const choiceGroupHeading = (container, optionLabels = []) => {
+            const headingElement = choiceGroupHeadingElement(container, optionLabels)
+            return headingElement ? text(headingElement) : attr(container, 'aria-label')
+          }
+          const choiceGroupRequired = (container, inputs = [], optionLabels = []) => {
+            if (
+              inputs.some((input) => input.required || attr(input, 'aria-required') === 'true')
+            ) {
+              return true
+            }
+            if (attr(container, 'aria-required') === 'true' || /required/i.test(attr(container, 'class'))) {
+              return true
+            }
+            const headingElement = choiceGroupHeadingElement(container, optionLabels)
+            return Boolean(
+              headingElement &&
+                (attr(headingElement, 'aria-required') === 'true' ||
+                  /required/i.test(attr(headingElement, 'class')))
+            )
+          }
           const makeBaseRecord = (element, extra = {}) => {
             const tag = element.tagName.toLowerCase()
             const inputType = tag === 'input' ? (attr(element, 'type') || 'text').toLowerCase() : tag
@@ -175,7 +258,14 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
             }
           }
           const choiceOptionRecord = (element) => {
+            const tag = element.tagName.toLowerCase()
+            const inputType = tag === 'input' ? (attr(element, 'type') || 'text').toLowerCase() : tag
+            const choiceLabelElement =
+              tag === 'input' && ['radio', 'checkbox'].includes(inputType)
+                ? associatedChoiceLabel(element)
+                : null
             const optionLabel =
+              text(choiceLabelElement) ||
               labelText(element) ||
               attr(element, 'aria-label') ||
               text(element) ||
@@ -187,11 +277,21 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
               attr(element, 'data-key') ||
               optionLabel ||
               'option'
+            const choiceLabelSelectors = choiceLabelElement
+              ? mergeSelectorCandidates(
+                  attr(choiceLabelElement, 'for') ? [`label[for="${quote(attr(choiceLabelElement, 'for'))}"]`] : [],
+                  selectorCandidatesFor(choiceLabelElement)
+                )
+              : []
+            const optionSelectors = mergeSelectorCandidates(
+              choiceLabelSelectors,
+              selectorCandidatesFor(element)
+            )
             return {
               label: optionLabel || 'Option',
               value: optionValue,
-              selector: selectorFor(element),
-              selector_candidates: selectorCandidatesFor(element),
+              selector: optionSelectors[0] || selectorFor(element),
+              selector_candidates: optionSelectors,
             }
           }
           const listboxForElement = (element) => {
@@ -218,37 +318,71 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
             seen.add(element)
 
             if (inputType === 'radio') {
+              const optionRecord = choiceOptionRecord(element)
               const groupKey = `radio:${attr(element, 'name') || attr(element, 'id') || selectorFor(element)}`
+              const groupContainer = element.closest('fieldset')
+              const groupLabel = choiceGroupHeading(groupContainer, [optionRecord.label])
               const group = groupedRecords.get(groupKey) || {
-                ...makeBaseRecord(element),
+                ...makeBaseRecord(groupContainer || element, {
+                  field_type: 'radio',
+                  input_type: groupContainer ? 'radiogroup' : 'radio',
+                  html_name: attr(element, 'name') || null,
+                  html_id: attr(element, 'id') || null,
+                  label: groupLabel || labelText(element),
+                  question_text: groupLabel || questionText(element, labelText(element)),
+                  required: groupContainer
+                    ? choiceGroupRequired(groupContainer, [element], [optionRecord.label])
+                    : element.required ||
+                      attr(element, 'aria-required') === 'true' ||
+                      /required/i.test(questionText(element, labelText(element))),
+                }),
                 options: [],
               }
-              group.options.push({
-                label: labelText(element) || attr(element, 'value') || 'Option',
-                value: attr(element, 'value') || labelText(element) || 'option',
-                selector: selectorFor(element),
-                selector_candidates: selectorCandidatesFor(element),
-              })
+              group.options.push(optionRecord)
+              if (groupContainer) {
+                const optionLabels = group.options.map((option) => option.label)
+                const updatedLabel = choiceGroupHeading(groupContainer, optionLabels)
+                group.label = updatedLabel || group.label
+                group.question_text = updatedLabel || group.question_text
+                group.required = choiceGroupRequired(groupContainer, [element], optionLabels)
+              }
               groupedRecords.set(groupKey, group)
               continue
             }
 
             if (inputType === 'checkbox' && attr(element, 'name')) {
+              const optionRecord = choiceOptionRecord(element)
               const groupKey = `checkbox:${attr(element, 'name')}`
               const count = document.querySelectorAll(
                 `input[type="checkbox"][name="${CSS.escape(attr(element, 'name'))}"]`
               ).length
               if (count > 1) {
+                const groupContainer = element.closest('fieldset')
+                const groupLabel = choiceGroupHeading(groupContainer, [optionRecord.label])
                 const group = groupedRecords.get(groupKey) || {
-                  ...makeBaseRecord(element),
+                  ...makeBaseRecord(groupContainer || element, {
+                    field_type: 'checkbox',
+                    input_type: groupContainer ? 'checkboxgroup' : 'checkbox',
+                    html_name: attr(element, 'name') || null,
+                    html_id: attr(element, 'id') || null,
+                    label: groupLabel || labelText(element),
+                    question_text: groupLabel || questionText(element, labelText(element)),
+                    required: groupContainer
+                      ? choiceGroupRequired(groupContainer, [element], [optionRecord.label])
+                      : element.required ||
+                        attr(element, 'aria-required') === 'true' ||
+                        /required/i.test(questionText(element, labelText(element))),
+                  }),
                   options: [],
                 }
-                group.options.push({
-                  label: labelText(element) || attr(element, 'value') || 'Option',
-                  value: attr(element, 'value') || labelText(element) || 'option',
-                  selector: selectorFor(element),
-                  selector_candidates: selectorCandidatesFor(element),
-                })
+                group.options.push(optionRecord)
+                if (groupContainer) {
+                  const optionLabels = group.options.map((option) => option.label)
+                  const updatedLabel = choiceGroupHeading(groupContainer, optionLabels)
+                  group.label = updatedLabel || group.label
+                  group.question_text = updatedLabel || group.question_text
+                  group.required = choiceGroupRequired(groupContainer, [element], optionLabels)
+                }
                 groupedRecords.set(groupKey, group)
                 continue
               }
@@ -271,6 +405,49 @@ def extract_form_fields(page) -> list[WorkerFieldState]:
               ...makeBaseRecord(element),
               options: [],
             })
+          }
+
+          for (const fieldset of Array.from(document.querySelectorAll('fieldset'))) {
+            if (!isVisible(fieldset)) {
+              continue
+            }
+            const groupedChoiceInputs = new Map()
+            for (const input of Array.from(
+              fieldset.querySelectorAll('input[type="radio"], input[type="checkbox"]')
+            )) {
+              const inputType = (attr(input, 'type') || '').toLowerCase()
+              if (!inputType || attr(input, 'aria-hidden') === 'true') {
+                continue
+              }
+              const groupKey = `${inputType}:${attr(input, 'name') || attr(input, 'id') || selectorFor(fieldset)}`
+              const group = groupedChoiceInputs.get(groupKey) || []
+              group.push(input)
+              groupedChoiceInputs.set(groupKey, group)
+            }
+
+            for (const [groupKey, inputs] of groupedChoiceInputs.entries()) {
+              if (groupedRecords.has(groupKey)) {
+                continue
+              }
+              const inputType = (attr(inputs[0], 'type') || 'radio').toLowerCase()
+              const options = inputs.map((input) => choiceOptionRecord(input))
+              const label = choiceGroupHeading(fieldset, options.map((option) => option.label))
+              if (!label && options.length < 2) {
+                continue
+              }
+              groupedRecords.set(groupKey, {
+                ...makeBaseRecord(fieldset, {
+                  field_type: inputType,
+                  input_type: `${inputType}group`,
+                  html_name: attr(inputs[0], 'name') || null,
+                  html_id: attr(inputs[0], 'id') || null,
+                  label,
+                  question_text: label || text(fieldset),
+                  required: choiceGroupRequired(fieldset, inputs, options.map((option) => option.label)),
+                }),
+                options,
+              })
+            }
           }
 
           for (const element of Array.from(

@@ -27,6 +27,18 @@ export interface CandidateProfilePayload {
   links: Record<string, string>
 }
 
+export interface SearchPreferencesPayload {
+  target_titles: string[]
+  target_responsibilities: string[]
+  locations: string[]
+  workplace_modes: Array<'remote' | 'hybrid' | 'on-site'>
+  include_keywords: string[]
+  exclude_keywords: string[]
+  companies_include: string[]
+  companies_exclude: string[]
+  result_limit: number
+}
+
 export interface CandidateProfileResponse {
   id: number
   full_name?: string | null
@@ -37,6 +49,7 @@ export interface CandidateProfileResponse {
   source_of_truth: string
   merged_profile: CandidateProfilePayload
   field_sources: Record<string, string>
+  search_preferences: SearchPreferencesPayload
 }
 
 export interface ProfileSourcePayload {
@@ -50,6 +63,7 @@ export interface ProfileSourcePayload {
 export interface JobLeadResponse {
   id: number
   source: string
+  discovery_method: string
   company: string
   title: string
   location?: string | null
@@ -72,6 +86,14 @@ export interface JobLeadResponse {
     github_summary?: string
     top_languages?: string[]
   }
+}
+
+export interface WebJobDiscoveryResponse {
+  jobs: JobLeadResponse[]
+  search_preferences: SearchPreferencesPayload
+  search_queries: string[]
+  source_urls: string[]
+  grounded_pages_count: number
 }
 
 export interface ScreeningAnswerPayload {

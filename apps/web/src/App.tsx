@@ -1,6 +1,8 @@
 import {
   type CSSProperties,
   type Dispatch,
+  type KeyboardEvent,
+  type MouseEvent,
   type SetStateAction,
   useCallback,
   useEffect,
@@ -13,14 +15,15 @@ import {
   assistApplicationDraft,
   buildApiUrl,
   bulkDeleteJobLeads,
-  captureLinkedinLead,
   createDraft,
+  discoverAshby,
+  discoverGreenhouse,
+  discoverLever,
+  discoverWebJobs,
   deleteApplicationDraft,
   deleteJobLead,
   deleteProfileSource,
   deleteWorkerRun,
-  discoverGreenhouse,
-  discoverLever,
   getDashboard,
   runWorker,
   updateProfile,
@@ -33,12 +36,16 @@ import type {
   CandidateProfilePayload,
   DashboardResponse,
   JobLeadResponse,
+  SearchPreferencesPayload,
   ScreeningAnswerPayload,
+  WebJobDiscoveryResponse,
   WorkerFieldState,
   WorkerRunResponse,
 } from './types'
 
 type WorkplaceFilterValue = 'all' | 'remote' | 'hybrid' | 'on-site'
+type SearchWorkplaceMode = Exclude<WorkplaceFilterValue, 'all'>
+type ManualAtsSource = 'greenhouse' | 'lever' | 'ashbyhq'
 type DraftEditorState = {
   cover_note: string
   screening_answers: ScreeningAnswerPayload[]
@@ -57,6 +64,10 @@ type ToastNotification = {
   message: string
   tone: ToastTone
 }
+type LastWebDiscoveryState = Pick<
+  WebJobDiscoveryResponse,
+  'grounded_pages_count' | 'search_queries' | 'source_urls'
+>
 
 const emptyProfile: CandidateProfilePayload = {
   full_name: '',
@@ -71,6 +82,45 @@ const emptyProfile: CandidateProfilePayload = {
   education: [],
   links: {},
 }
+const emptySearchPreferences: SearchPreferencesPayload = {
+  target_titles: [],
+  target_responsibilities: [],
+  locations: [],
+  workplace_modes: [],
+  include_keywords: [],
+  exclude_keywords: [],
+  companies_include: [],
+  companies_exclude: [],
+  result_limit: 10,
+}
+const emptyManualDiscoveryInputs: Record<ManualAtsSource, string[]> = {
+  greenhouse: [],
+  lever: [],
+  ashbyhq: [],
+}
+const manualDiscoveryConfig: Record<
+  ManualAtsSource,
+  { label: string; placeholder: string; buttonLabel: string; helperText: string }
+> = {
+  greenhouse: {
+    label: 'Greenhouse company or board token',
+    placeholder: 'canonical\nriskledger',
+    buttonLabel: 'Discover Greenhouse Jobs',
+    helperText: 'Use the company path from a public Greenhouse board URL.',
+  },
+  lever: {
+    label: 'Lever company slug',
+    placeholder: 'netflix\nfigma',
+    buttonLabel: 'Discover Lever Jobs',
+    helperText: 'Use the slug from jobs.lever.co/<company-slug>.',
+  },
+  ashbyhq: {
+    label: 'Ashby company or board name',
+    placeholder: 'notion\nopenai',
+    buttonLabel: 'Discover Ashby Jobs',
+    helperText: 'Use the final path segment from jobs.ashbyhq.com/<board-name>.',
+  },
+}
 const DEFAULT_MIN_VISIBLE_SCORE = 1
 const fitScoreOptions = [DEFAULT_MIN_VISIBLE_SCORE, 0, 40, 50, 60, 70, 80]
 const jobHunterLogo = '/assets/icons/pt-job-hunting-logo.png'
@@ -83,20 +133,17 @@ function App() {
   const [cvFile, setCvFile] = useState<File | null>(null)
   const [linkedinText, setLinkedinText] = useState('')
   const [linkedinFile, setLinkedinFile] = useState<File | null>(null)
-  const [greenhouseBoards, setGreenhouseBoards] = useState('openai\nanthropic')
-  const [leverBoards, setLeverBoards] = useState('netflix')
-  const [manualLead, setManualLead] = useState({
-    company: '',
-    title: '',
-    url: '',
-    location: '',
-    description: '',
-    notes: '',
-  })
+  const [searchPreferences, setSearchPreferences] =
+    useState<SearchPreferencesPayload>(emptySearchPreferences)
+  const [lastWebDiscovery, setLastWebDiscovery] = useState<LastWebDiscoveryState | null>(null)
+  const [manualDiscoveryInputs, setManualDiscoveryInputs] =
+    useState<Record<ManualAtsSource, string[]>>(emptyManualDiscoveryInputs)
   const [profileEditor, setProfileEditor] = useState<CandidateProfilePayload>(emptyProfile)
   const [lastWorkerRun, setLastWorkerRun] = useState<WorkerRunResponse | null>(null)
   const [draftEditors, setDraftEditors] = useState<Record<number, DraftEditorState>>({})
   const [reviewOverrides, setReviewOverrides] = useState<Record<number, Record<string, string>>>({})
+  const [collapsedDraftIds, setCollapsedDraftIds] = useState<Record<number, boolean>>({})
+  const [collapsedWorkerRunIds, setCollapsedWorkerRunIds] = useState<Record<number, boolean>>({})
   const [pendingDraftJumpId, setPendingDraftJumpId] = useState<number | null>(null)
   const [highlightedDraftId, setHighlightedDraftId] = useState<number | null>(null)
   const [expandedJobIds, setExpandedJobIds] = useState<Record<number, boolean>>({})
@@ -105,10 +152,12 @@ function App() {
   const [showAppliedJobs, setShowAppliedJobs] = useState(false)
   const [shortlistFilters, setShortlistFilters] = useState<{
     minScore: number
+    company: string
     location: string
     workplace: WorkplaceFilterValue
   }>({
     minScore: DEFAULT_MIN_VISIBLE_SCORE,
+    company: '',
     location: '',
     workplace: 'all',
   })
@@ -128,18 +177,75 @@ function App() {
     return true
   }, [])
 
+  const isToggleHeaderInteractiveTarget = useCallback((target: EventTarget | null) => {
+    return target instanceof HTMLElement && Boolean(target.closest('button, a, input, select, textarea'))
+  }, [])
+
+  const handleToggleHeaderClick = useCallback(
+    (event: MouseEvent<HTMLElement>, toggle: () => void) => {
+      if (isToggleHeaderInteractiveTarget(event.target)) {
+        return
+      }
+      toggle()
+    },
+    [isToggleHeaderInteractiveTarget],
+  )
+
+  const handleToggleHeaderKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLElement>, toggle: () => void) => {
+      if (event.target !== event.currentTarget) {
+        return
+      }
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        toggle()
+      }
+    },
+    [],
+  )
+
   const jumpToSection = useCallback((sectionId: string) => {
+    if (sectionId === 'shortlist-section') {
+      setIsShortlistCollapsed(false)
+    }
+    if (sectionId === 'worker-run-section' && lastWorkerRun?.id) {
+      setCollapsedWorkerRunIds((current) =>
+        current[lastWorkerRun.id] ? { ...current, [lastWorkerRun.id]: false } : current,
+      )
+    }
     return scrollToElement(document.getElementById(sectionId))
-  }, [scrollToElement])
+  }, [lastWorkerRun?.id, scrollToElement])
 
   const jumpToDraft = useCallback((applicationId: number) => {
+    const revealAndScroll = () => {
+      const nextDraftElement = document.getElementById(`application-draft-${applicationId}`)
+      if (!nextDraftElement) {
+        return false
+      }
+      setHighlightedDraftId(applicationId)
+      return scrollToElement(nextDraftElement, 'textarea, input')
+    }
+
     const draftElement = document.getElementById(`application-draft-${applicationId}`)
-    if (!draftElement) {
+    const isCollapsed = collapsedDraftIds[applicationId] ?? false
+    if (draftElement && !isCollapsed) {
+      setHighlightedDraftId(applicationId)
+      return scrollToElement(draftElement, 'textarea, input')
+    }
+
+    const hasDraft = (dashboard?.applications ?? []).some((application) => application.id === applicationId)
+    if (!hasDraft) {
       return false
     }
-    setHighlightedDraftId(applicationId)
-    return scrollToElement(draftElement, 'textarea, input')
-  }, [scrollToElement])
+
+    setCollapsedDraftIds((current) =>
+      current[applicationId] ? { ...current, [applicationId]: false } : current,
+    )
+    window.setTimeout(() => {
+      revealAndScroll()
+    }, 180)
+    return true
+  }, [collapsedDraftIds, dashboard?.applications, scrollToElement])
 
   const jumpToJob = useCallback((jobId: number) => {
     setIsShortlistCollapsed(false)
@@ -214,6 +320,12 @@ function App() {
   }, [dashboard?.profile])
 
   useEffect(() => {
+    if (dashboard?.profile?.search_preferences) {
+      setSearchPreferences(normalizeSearchPreferences(dashboard.profile.search_preferences))
+    }
+  }, [dashboard?.profile?.search_preferences])
+
+  useEffect(() => {
     if (!dashboard?.applications) {
       return
     }
@@ -239,6 +351,18 @@ function App() {
   }, [dashboard?.applications])
 
   useEffect(() => {
+    if (!dashboard?.applications) {
+      return
+    }
+    const applicationIds = new Set(dashboard.applications.map((application) => application.id))
+    setCollapsedDraftIds((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(([applicationId]) => applicationIds.has(Number(applicationId))),
+      ),
+    )
+  }, [dashboard?.applications])
+
+  useEffect(() => {
     if (!dashboard?.jobs) {
       return
     }
@@ -249,6 +373,16 @@ function App() {
       ),
     )
   }, [dashboard?.jobs])
+
+  useEffect(() => {
+    if (!dashboard?.worker_runs) {
+      return
+    }
+    const runIds = new Set(dashboard.worker_runs.map((run) => run.id))
+    setCollapsedWorkerRunIds((current) =>
+      Object.fromEntries(Object.entries(current).filter(([runId]) => runIds.has(Number(runId)))),
+    )
+  }, [dashboard?.worker_runs])
 
   useEffect(() => {
     const latestRun = dashboard?.worker_runs?.[0] ?? null
@@ -323,11 +457,30 @@ function App() {
     return next
   }, [dashboard?.applications])
 
+  const companyFilterOptions = useMemo(() => {
+    const next = new Map<string, string>()
+    for (const job of rankedJobs) {
+      const company = job.company.trim()
+      if (!company) {
+        continue
+      }
+      const normalizedCompany = company.toLowerCase()
+      if (!next.has(normalizedCompany)) {
+        next.set(normalizedCompany, company)
+      }
+    }
+    return [...next.values()].sort((left, right) => left.localeCompare(right))
+  }, [rankedJobs])
+
   const filteredShortlist = useMemo(() => {
+    const normalizedCompanyFilter = shortlistFilters.company.trim().toLowerCase()
     const normalizedLocationFilter = shortlistFilters.location.trim().toLowerCase()
 
     return rankedJobs.filter((job) => {
       if ((job.score ?? 0) < shortlistFilters.minScore) {
+        return false
+      }
+      if (normalizedCompanyFilter && job.company.trim().toLowerCase() !== normalizedCompanyFilter) {
         return false
       }
       if (
@@ -373,6 +526,7 @@ function App() {
 
   const hasShortlistFilters =
     shortlistFilters.minScore !== DEFAULT_MIN_VISIBLE_SCORE ||
+    shortlistFilters.company.trim().length > 0 ||
     shortlistFilters.location.trim().length > 0 ||
     shortlistFilters.workplace !== 'all'
   const canBulkDeleteFilteredJobs = hasShortlistFilters && shortlist.length > 0
@@ -483,6 +637,45 @@ function App() {
     })
   }
 
+  function updateSearchPreferenceList(
+    field:
+      | 'target_titles'
+      | 'target_responsibilities'
+      | 'locations'
+      | 'include_keywords'
+      | 'exclude_keywords'
+      | 'companies_include'
+      | 'companies_exclude',
+    value: string,
+  ) {
+    setSearchPreferences((current) => ({
+      ...current,
+      [field]: splitEditorLines(value),
+    }))
+  }
+
+  function toggleSearchWorkplaceMode(mode: SearchWorkplaceMode) {
+    setSearchPreferences((current) => ({
+      ...current,
+      workplace_modes: current.workplace_modes.includes(mode)
+        ? current.workplace_modes.filter((item) => item !== mode)
+        : [...current.workplace_modes, mode],
+    }))
+  }
+
+  function resetSearchPreferences() {
+    setSearchPreferences(
+      normalizeSearchPreferences(dashboard?.profile?.search_preferences ?? emptySearchPreferences),
+    )
+  }
+
+  function updateManualDiscoveryInput(source: ManualAtsSource, value: string) {
+    setManualDiscoveryInputs((current) => ({
+      ...current,
+      [source]: splitEditorLines(value),
+    }))
+  }
+
   async function handleDeleteProfileSource(sourceId: number, sourceLabel: string) {
     const confirmed = window.confirm(
       `Delete imported source "${sourceLabel}"? This will remove it from the merged profile state.`,
@@ -497,46 +690,52 @@ function App() {
     })
   }
 
-  async function handleDiscovery(source: 'greenhouse' | 'lever') {
-    await runAction(`discover-${source}`, async () => {
-      const identifiers =
-        source === 'greenhouse' ? splitLines(greenhouseBoards) : splitLines(leverBoards)
-      if (identifiers.length === 0) {
-        throw new Error(`Add at least one ${source} identifier.`)
+  async function handleWebDiscovery() {
+    await runAction('discover-web', async () => {
+      const normalizedPreferences = normalizeSearchPreferences(searchPreferences)
+      const hasIntent =
+        normalizedPreferences.target_titles.length > 0 ||
+        normalizedPreferences.target_responsibilities.length > 0 ||
+        normalizedPreferences.include_keywords.length > 0
+      if (!hasIntent) {
+        throw new Error('Add at least one target title, responsibility, or keyword before discovery.')
       }
-      const jobs =
-        source === 'greenhouse'
-          ? await discoverGreenhouse(identifiers)
-          : await discoverLever(identifiers)
-      return `Discovered ${jobs.length} ${source} ${jobs.length === 1 ? 'role' : 'roles'} from ${identifiers.length} ${identifiers.length === 1 ? 'identifier' : 'identifiers'}.`
+      let result: WebJobDiscoveryResponse
+      try {
+        result = await discoverWebJobs(normalizedPreferences)
+      } catch (error) {
+        throw new Error(formatDiscoveryErrorMessage(error))
+      }
+      setSearchPreferences(normalizeSearchPreferences(result.search_preferences))
+      setLastWebDiscovery({
+        grounded_pages_count: result.grounded_pages_count,
+        search_queries: result.search_queries,
+        source_urls: result.source_urls,
+      })
+      const queryCount = result.search_queries.length
+      return `Discovered ${result.jobs.length} ${result.jobs.length === 1 ? 'role' : 'roles'} from ${result.grounded_pages_count} grounded ${result.grounded_pages_count === 1 ? 'page' : 'pages'}${queryCount > 0 ? ` across ${queryCount} search ${queryCount === 1 ? 'query' : 'queries'}` : ''}.`
     })
   }
 
-  async function handleLinkedinLeadCapture() {
-    if (!manualLead.company || !manualLead.title) {
-      updateStatus('LinkedIn lead capture requires a company and job title.', {
+  async function handleManualDiscovery(source: ManualAtsSource) {
+    const identifiers = splitLines(manualDiscoveryInputs[source].join('\n'))
+    if (identifiers.length === 0) {
+      updateStatus(`Add at least one ${manualDiscoveryConfig[source].label.toLowerCase()} before discovery.`, {
         tone: 'warning',
         toast: true,
       })
       return
     }
-    await runAction('linkedin-lead', async () => {
-      await captureLinkedinLead({
-        ...manualLead,
-        url: manualLead.url || undefined,
-        location: manualLead.location || undefined,
-        description: manualLead.description || undefined,
-        notes: manualLead.notes || undefined,
-      })
-      setManualLead({
-        company: '',
-        title: '',
-        url: '',
-        location: '',
-        description: '',
-        notes: '',
-      })
-      return 'LinkedIn lead added to the queue.'
+
+    await runAction(`discover-${source}`, async () => {
+      const jobs =
+        source === 'greenhouse'
+          ? await discoverGreenhouse(identifiers)
+          : source === 'lever'
+            ? await discoverLever(identifiers)
+            : await discoverAshby(identifiers)
+      const providerLabel = source === 'ashbyhq' ? 'Ashby' : source[0].toUpperCase() + source.slice(1)
+      return `Manual ${providerLabel} discovery found ${jobs.length} ${jobs.length === 1 ? 'role' : 'roles'} from ${identifiers.length} identifier${identifiers.length === 1 ? '' : 's'}.`
     })
   }
 
@@ -701,7 +900,7 @@ function App() {
     }
 
     const busyLabel = options.confirmSubmit ? `submit-${applicationId}` : `preview-${applicationId}`
-    let completedRun: WorkerRunResponse | null = null
+    let completedRunId: number | null = null
     await runAction(busyLabel, async () => {
       const result = await runWorker(applicationId, {
         dry_run: options.dryRun,
@@ -710,7 +909,7 @@ function App() {
         screening_answers: editor.screening_answers,
         answer_overrides: buildAnswerOverrides(applicationId, reviewOverrides),
       })
-      completedRun = result
+      completedRunId = result.id
       setLastWorkerRun(result)
       seedReviewOverrides(result, setReviewOverrides)
       return {
@@ -719,7 +918,12 @@ function App() {
         toast: true,
       }
     })
-    if (completedRun) {
+    if (completedRunId !== null) {
+      const runId = completedRunId
+      setCollapsedWorkerRunIds((current) => ({
+        ...current,
+        [runId]: false,
+      }))
       jumpToSection('worker-run-section')
     }
   }
@@ -837,6 +1041,7 @@ function App() {
   const autofillReadyFields = (lastWorkerRun?.fields ?? []).filter(
     (field) => field.answer_value && !field.requires_review,
   )
+  const isLastWorkerRunCollapsed = lastWorkerRun ? (collapsedWorkerRunIds[lastWorkerRun.id] ?? false) : false
 
   return (
     <main className="app-shell">
@@ -878,9 +1083,9 @@ function App() {
           </div>
           <h1>Serious job search automation with a final approval gate.</h1>
           <p className="hero-copy">
-            Upload your CV, optionally merge LinkedIn data, discover ATS roles, generate tailored
-            drafts, preview semantic autofill, review hard questions, and only submit when the
-            application looks complete.
+            Upload your CV, optionally merge LinkedIn data, run manual ATS discovery or experimental
+            AI search, generate tailored drafts, preview semantic autofill, review hard questions, and
+            only submit when the application looks complete.
           </p>
         </div>
         <aside className="status-panel">
@@ -1047,7 +1252,7 @@ function App() {
               onChange={(event) =>
                 setProfileEditor((current) => ({
                   ...current,
-                  skills: splitLines(event.target.value),
+                    skills: splitEditorLines(event.target.value),
                 }))
               }
             />
@@ -1060,7 +1265,7 @@ function App() {
               onChange={(event) =>
                 setProfileEditor((current) => ({
                   ...current,
-                  achievements: splitLines(event.target.value),
+                    achievements: splitEditorLines(event.target.value),
                 }))
               }
             />
@@ -1073,91 +1278,204 @@ function App() {
 
       <section className="grid two-column">
         <article className="panel">
-          <h2>ATS Discovery</h2>
-          <label className="field">
-            <span>Greenhouse board tokens</span>
-            <textarea
-              rows={4}
-              value={greenhouseBoards}
-              onChange={(event) => setGreenhouseBoards(event.target.value)}
-            />
-          </label>
-          <button
-            onClick={() => void handleDiscovery('greenhouse')}
-            disabled={busyKey === 'discover-greenhouse'}
-          >
-            {busyKey === 'discover-greenhouse' ? 'Discovering...' : 'Fetch Greenhouse Roles'}
-          </button>
-
-          <label className="field">
-            <span>Lever company slugs</span>
-            <textarea
-              rows={4}
-              value={leverBoards}
-              onChange={(event) => setLeverBoards(event.target.value)}
-            />
-          </label>
-          <button
-            onClick={() => void handleDiscovery('lever')}
-            disabled={busyKey === 'discover-lever'}
-          >
-            {busyKey === 'discover-lever' ? 'Discovering...' : 'Fetch Lever Roles'}
-          </button>
-        </article>
-
-        <article className="panel">
-          <h2>LinkedIn Lead Capture</h2>
+          <h2>AI Web Discovery</h2>
+          <p className="panel-subtitle">
+            Experimental. Gemini grounded search uses your saved profile and explicit search intent to
+            scout for direct Greenhouse, Lever, and Ashby job pages. Use manual ATS discovery when you
+            already know the company.
+          </p>
           <div className="profile-grid">
             <label className="field">
-              <span>Company</span>
-              <input
-                value={manualLead.company}
+              <span>Target titles (one per line)</span>
+              <textarea
+                rows={5}
+                value={searchPreferences.target_titles.join('\n')}
+                onChange={(event) => updateSearchPreferenceList('target_titles', event.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>Target responsibilities (one per line)</span>
+              <textarea
+                rows={5}
+                value={searchPreferences.target_responsibilities.join('\n')}
                 onChange={(event) =>
-                  setManualLead((current) => ({ ...current, company: event.target.value }))
+                  updateSearchPreferenceList('target_responsibilities', event.target.value)
                 }
               />
             </label>
             <label className="field">
-              <span>Title</span>
-              <input
-                value={manualLead.title}
+              <span>Preferred locations (one per line)</span>
+              <textarea
+                rows={4}
+                value={searchPreferences.locations.join('\n')}
+                onChange={(event) => updateSearchPreferenceList('locations', event.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>Include keywords (one per line)</span>
+              <textarea
+                rows={4}
+                value={searchPreferences.include_keywords.join('\n')}
                 onChange={(event) =>
-                  setManualLead((current) => ({ ...current, title: event.target.value }))
+                  updateSearchPreferenceList('include_keywords', event.target.value)
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Exclude keywords (one per line)</span>
+              <textarea
+                rows={4}
+                value={searchPreferences.exclude_keywords.join('\n')}
+                onChange={(event) =>
+                  updateSearchPreferenceList('exclude_keywords', event.target.value)
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Companies to prioritize (one per line)</span>
+              <textarea
+                rows={4}
+                value={searchPreferences.companies_include.join('\n')}
+                onChange={(event) =>
+                  updateSearchPreferenceList('companies_include', event.target.value)
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Companies to avoid (one per line)</span>
+              <textarea
+                rows={4}
+                value={searchPreferences.companies_exclude.join('\n')}
+                onChange={(event) =>
+                  updateSearchPreferenceList('companies_exclude', event.target.value)
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Result limit</span>
+              <input
+                type="number"
+                min={1}
+                max={25}
+                value={searchPreferences.result_limit}
+                onChange={(event) =>
+                  setSearchPreferences((current) => ({
+                    ...current,
+                    result_limit: Math.min(25, Math.max(1, Number(event.target.value || 10))),
+                  }))
                 }
               />
             </label>
           </div>
-          <label className="field">
-            <span>URL</span>
-            <input
-              value={manualLead.url}
-              onChange={(event) =>
-                setManualLead((current) => ({ ...current, url: event.target.value }))
-              }
-            />
-          </label>
-          <label className="field">
-            <span>Description or notes</span>
-            <textarea
-              rows={4}
-              value={manualLead.description}
-              onChange={(event) =>
-                setManualLead((current) => ({ ...current, description: event.target.value }))
-              }
-            />
-          </label>
-          <button
-            onClick={() => void handleLinkedinLeadCapture()}
-            disabled={busyKey === 'linkedin-lead'}
-          >
-            {busyKey === 'linkedin-lead' ? 'Saving lead...' : 'Capture LinkedIn Lead'}
-          </button>
+          <div className="field shortlist-workplace-field">
+            <span>Preferred workplace modes</span>
+            <div className="filter-pill-row">
+              {([
+                ['remote', 'Remote'],
+                ['hybrid', 'Hybrid'],
+                ['on-site', 'On-site'],
+              ] as Array<[SearchWorkplaceMode, string]>).map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  className={`filter-pill ${searchPreferences.workplace_modes.includes(value) ? 'filter-pill-active' : ''}`}
+                  onClick={() => toggleSearchWorkplaceMode(value)}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="field-actions">
+            <button type="button" className="button-muted" onClick={() => resetSearchPreferences()}>
+              Reset from profile
+            </button>
+            <button onClick={() => void handleWebDiscovery()} disabled={busyKey === 'discover-web'}>
+              {busyKey === 'discover-web' ? 'Discovering...' : 'Discover Jobs'}
+            </button>
+          </div>
+          {lastWebDiscovery ? (
+            <div className="source-list">
+              <h3>Last grounded search</h3>
+              <p className="panel-subtitle">
+                Fetched {lastWebDiscovery.grounded_pages_count} grounded{' '}
+                {lastWebDiscovery.grounded_pages_count === 1 ? 'page' : 'pages'} from{' '}
+                {lastWebDiscovery.source_urls.length} source{' '}
+                {lastWebDiscovery.source_urls.length === 1 ? 'URL' : 'URLs'}.
+              </p>
+              {lastWebDiscovery.search_queries.length > 0 ? (
+                <label className="field">
+                  <span>Gemini search queries</span>
+                  <textarea
+                    readOnly
+                    rows={Math.min(6, Math.max(3, lastWebDiscovery.search_queries.length))}
+                    value={lastWebDiscovery.search_queries.join('\n')}
+                  />
+                </label>
+              ) : null}
+              {lastWebDiscovery.source_urls.length > 0 ? (
+                <label className="field">
+                  <span>Grounded source URLs</span>
+                  <textarea
+                    readOnly
+                    rows={Math.min(8, Math.max(3, lastWebDiscovery.source_urls.length))}
+                    value={lastWebDiscovery.source_urls.join('\n')}
+                  />
+                </label>
+              ) : null}
+            </div>
+          ) : null}
+        </article>
+
+        <article className="panel">
+          <h2>Manual ATS Discovery</h2>
+          <p className="panel-subtitle">
+            Use this when you already know the company. It calls the direct ATS endpoints and is more
+            reliable than the AI search flow.
+          </p>
+          {(['greenhouse', 'lever', 'ashbyhq'] as ManualAtsSource[]).map((source) => (
+            <div key={source} className="source-list">
+              <label className="field">
+                <span>{manualDiscoveryConfig[source].label} (one per line)</span>
+                <textarea
+                  rows={3}
+                  placeholder={manualDiscoveryConfig[source].placeholder}
+                  value={manualDiscoveryInputs[source].join('\n')}
+                  onChange={(event) => updateManualDiscoveryInput(source, event.target.value)}
+                />
+              </label>
+              <p className="panel-subtitle">{manualDiscoveryConfig[source].helperText}</p>
+              <div className="field-actions">
+                <button
+                  type="button"
+                  onClick={() => void handleManualDiscovery(source)}
+                  disabled={busyKey === `discover-${source}`}
+                >
+                  {busyKey === `discover-${source}`
+                    ? 'Discovering...'
+                    : manualDiscoveryConfig[source].buttonLabel}
+                </button>
+              </div>
+            </div>
+          ))}
         </article>
       </section>
 
       <section className="panel panel-section" id="shortlist-section">
-        <div className="panel-header">
-          <div className="panel-title-group">
+        <div
+          className="panel-header panel-header-toggle"
+          role="button"
+          tabIndex={0}
+          aria-expanded={!isShortlistCollapsed}
+          aria-controls="shortlist-body"
+          onClick={(event) =>
+            handleToggleHeaderClick(event, () => setIsShortlistCollapsed((current) => !current))
+          }
+          onKeyDown={(event) =>
+            handleToggleHeaderKeyDown(event, () => setIsShortlistCollapsed((current) => !current))
+          }
+        >
+          <div className="panel-title-group panel-title-group-shortlist">
             <p className="panel-kicker">Shortlist</p>
             <h2>Ranked Jobs</h2>
             <p className="panel-subtitle">
@@ -1166,34 +1484,32 @@ function App() {
             </p>
           </div>
           <div className="header-actions">
-            <span className="count-badge">
-              {hasShortlistFilters
-                ? `${shortlist.length} of ${rankedJobs.length} roles`
-                : `${shortlist.length} ${shortlist.length === 1 ? 'role' : 'roles'}`}
-            </span>
-            {appliedShortlistCount > 0 ? (
+            <div className="header-badges">
               <span className="count-badge">
-                {appliedShortlistCount} applied {showAppliedJobs ? 'shown' : 'hidden'}
+                {hasShortlistFilters
+                  ? `${shortlist.length} of ${rankedJobs.length} roles`
+                  : `${shortlist.length} ${shortlist.length === 1 ? 'role' : 'roles'}`}
               </span>
-            ) : null}
-            <button
-              className="button-muted"
-              onClick={() => void refreshDashboard()}
-              disabled={busyKey !== null}
-            >
-              Refresh
-            </button>
-            <button
-              type="button"
-              className="button-muted"
-              onClick={() => setIsShortlistCollapsed((current) => !current)}
-            >
-              {isShortlistCollapsed ? 'Expand' : 'Collapse'}
-            </button>
+              {appliedShortlistCount > 0 ? (
+                <span className="count-badge">
+                  {appliedShortlistCount} applied {showAppliedJobs ? 'shown' : 'hidden'}
+                </span>
+              ) : null}
+            </div>
+            <div className="header-controls">
+              <button
+                className="button-muted"
+                onClick={() => void refreshDashboard()}
+                disabled={busyKey !== null}
+              >
+                Refresh
+              </button>
+              <span className="collapse-indicator">{isShortlistCollapsed ? 'Show' : 'Hide'}</span>
+            </div>
           </div>
         </div>
         {!isShortlistCollapsed ? (
-          <div className="panel-body">
+          <div className="panel-body" id="shortlist-body">
           <div className="shortlist-toolbar">
             <div className="filter-grid">
               <label className="field field-compact">
@@ -1219,6 +1535,25 @@ function App() {
                 </select>
               </label>
               <label className="field field-compact">
+                <span>Company</span>
+                <select
+                  value={shortlistFilters.company}
+                  onChange={(event) =>
+                    setShortlistFilters((current) => ({
+                      ...current,
+                      company: event.target.value,
+                    }))
+                  }
+                >
+                  <option value="">All companies</option>
+                  {companyFilterOptions.map((company) => (
+                    <option key={company} value={company}>
+                      {company}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field field-compact">
                 <span>Location</span>
                 <input
                   value={shortlistFilters.location}
@@ -1231,7 +1566,7 @@ function App() {
                   placeholder="London, UK"
                 />
               </label>
-              <div className="field field-compact">
+              <div className="field field-compact shortlist-workplace-field">
                 <span>Workplace</span>
                 <div className="filter-pill-row">
                   {[
@@ -1278,6 +1613,7 @@ function App() {
                       onClick={() =>
                         setShortlistFilters({
                           minScore: DEFAULT_MIN_VISIBLE_SCORE,
+                          company: '',
                           location: '',
                           workplace: 'all',
                         })
@@ -1445,7 +1781,7 @@ function App() {
           ) : rankedJobs.length > 0 ? (
             <div className="empty-state">
               <p>No roles match the current filters.</p>
-              <span>Relax the fit score, location, or workplace filters to widen the shortlist.</span>
+              <span>Relax the fit score, company, location, or workplace filters to widen the shortlist.</span>
             </div>
           ) : (
             <div className="empty-state">
@@ -1475,179 +1811,209 @@ function App() {
               {(dashboard?.applications ?? []).length === 1 ? 'draft' : 'drafts'}
             </span>
           </div>
-          <div className="panel-body panel-body-compact">
-            {(dashboard?.applications ?? []).length > 0 ? (
-              <div className="stack">
-                {(dashboard?.applications ?? []).map((application) => {
-                  const draftEditor =
-                    draftEditors[application.id] ?? createDraftEditorState(application)
-                  const linkedJob = jobsById.get(application.job_lead_id)
-                  const latestRun = latestRunByApplicationId.get(application.id)
-                  const previewKey = `preview-${application.id}`
-                  const submitKey = `submit-${application.id}`
+          <div className="panel-body panel-body-compact" id="application-drafts-body">
+              {(dashboard?.applications ?? []).length > 0 ? (
+                <div className="stack">
+                  {(dashboard?.applications ?? []).map((application) => {
+                    const draftEditor =
+                      draftEditors[application.id] ?? createDraftEditorState(application)
+                    const linkedJob = jobsById.get(application.job_lead_id)
+                    const latestRun = latestRunByApplicationId.get(application.id)
+                    const previewKey = `preview-${application.id}`
+                    const submitKey = `submit-${application.id}`
+                  const isDraftCollapsed = collapsedDraftIds[application.id] ?? false
 
-                  return (
-                    <article
-                      key={application.id}
-                      id={`application-draft-${application.id}`}
-                      className={`draft-card ${highlightedDraftId === application.id ? 'draft-card-highlighted' : ''}`}
-                    >
-                      <div className="draft-card-header">
-                        <div className="draft-card-title-group">
-                          <h3>{linkedJob?.title ?? `Draft #${application.id}`}</h3>
-                          <p className="draft-card-company">
-                            {linkedJob ? `${linkedJob.company} · ${formatJobSource(linkedJob.source)}` : `Draft #${application.id}`}
-                          </p>
-                        </div>
-                        <span className={getWorkerStatusBadgeClassName(application.status)}>
-                          {formatWorkerStatus(application.status)}
-                        </span>
-                      </div>
-                      <p>{application.tailored_summary}</p>
-                      <ul>
-                        {application.resume_bullets.map((bullet) => (
-                          <li key={bullet}>{bullet}</li>
-                        ))}
-                      </ul>
-                      <label className="field">
-                        <span>Cover note</span>
-                        <textarea
-                          rows={4}
-                          value={draftEditor.cover_note}
-                          onChange={(event) => updateDraftCoverNote(application.id, event.target.value)}
-                        />
-                      </label>
-                      <div className="field-actions">
-                        <button
-                          type="button"
-                          className="button-secondary button-small"
-                          onClick={() => void handleAssistCoverNote(application.id)}
-                          disabled={busyKey === `ai-cover-${application.id}`}
-                        >
-                          <AiAssistLabel
-                            busy={busyKey === `ai-cover-${application.id}`}
-                            hasExistingText={draftEditor.cover_note.trim().length > 0}
-                          />
-                        </button>
-                      </div>
-                      <div className="screening-answer-list">
-                        {draftEditor.screening_answers.map((screeningAnswer, index) => (
-                          <div
-                            key={`${application.id}-${screeningAnswer.question}`}
-                            className="field field-compact"
-                          >
-                            <span>{screeningAnswer.question}</span>
-                            <textarea
-                              rows={3}
-                              value={screeningAnswer.answer}
-                              onChange={(event) =>
-                                updateScreeningAnswer(application.id, index, event.target.value)
-                              }
-                            />
-                            <div className="field-actions">
-                              <button
-                                type="button"
-                                className="button-secondary button-small"
-                                onClick={() =>
-                                  void handleAssistScreeningAnswer(
-                                    application.id,
-                                    screeningAnswer.question,
-                                    screeningAnswer.answer,
-                                    index,
-                                  )
-                                }
-                                disabled={busyKey === `ai-screening-${application.id}-${index}`}
-                              >
-                                <AiAssistLabel
-                                  busy={busyKey === `ai-screening-${application.id}-${index}`}
-                                  hasExistingText={screeningAnswer.answer.trim().length > 0}
-                                />
-                              </button>
-                            </div>
+                    return (
+                      <article
+                        key={application.id}
+                        id={`application-draft-${application.id}`}
+                        className={`draft-card ${highlightedDraftId === application.id ? 'draft-card-highlighted' : ''}`}
+                      >
+                      <div
+                        className="draft-card-header panel-header-toggle"
+                        role="button"
+                        tabIndex={0}
+                        aria-expanded={!isDraftCollapsed}
+                        aria-controls={`application-draft-body-${application.id}`}
+                        onClick={() =>
+                          setCollapsedDraftIds((current) => ({
+                            ...current,
+                            [application.id]: !current[application.id],
+                          }))
+                        }
+                        onKeyDown={(event) =>
+                          handleToggleHeaderKeyDown(event, () =>
+                            setCollapsedDraftIds((current) => ({
+                              ...current,
+                              [application.id]: !current[application.id],
+                            })),
+                          )
+                        }
+                      >
+                          <div className="draft-card-title-group">
+                            <h3>{linkedJob?.title ?? `Draft #${application.id}`}</h3>
+                            <p className="draft-card-company">
+                              {linkedJob ? `${linkedJob.company} · ${formatJobSource(linkedJob.source)}` : `Draft #${application.id}`}
+                            </p>
                           </div>
-                        ))}
-                      </div>
-                      {latestRun ? (
-                        <div className="draft-run-summary">
-                          <span className="count-badge">
-                            {latestRun.preview_summary.autofill_ready_count} autofill-ready
+                        <div className="panel-header-meta">
+                          <span className={getWorkerStatusBadgeClassName(application.status)}>
+                            {formatWorkerStatus(application.status)}
                           </span>
-                          <span className="count-badge">
-                            {latestRun.preview_summary.review_required_count} review items
+                          <span className="collapse-indicator">
+                            {isDraftCollapsed ? 'Show' : 'Hide'}
                           </span>
                         </div>
-                      ) : null}
-                      {latestRun || linkedJob ? (
-                        <div className="field-actions">
+                        </div>
+                      {!isDraftCollapsed ? (
+                        <div className="draft-card-body" id={`application-draft-body-${application.id}`}>
+                          <p>{application.tailored_summary}</p>
+                          <ul>
+                            {application.resume_bullets.map((bullet) => (
+                              <li key={bullet}>{bullet}</li>
+                            ))}
+                          </ul>
+                          <label className="field">
+                            <span>Cover note</span>
+                            <textarea
+                              rows={4}
+                              value={draftEditor.cover_note}
+                              onChange={(event) => updateDraftCoverNote(application.id, event.target.value)}
+                            />
+                          </label>
+                          <div className="field-actions">
+                            <button
+                              type="button"
+                              className="button-secondary button-small"
+                              onClick={() => void handleAssistCoverNote(application.id)}
+                              disabled={busyKey === `ai-cover-${application.id}`}
+                            >
+                              <AiAssistLabel
+                                busy={busyKey === `ai-cover-${application.id}`}
+                                hasExistingText={draftEditor.cover_note.trim().length > 0}
+                              />
+                            </button>
+                          </div>
+                          <div className="screening-answer-list">
+                            {draftEditor.screening_answers.map((screeningAnswer, index) => (
+                              <div
+                                key={`${application.id}-${screeningAnswer.question}`}
+                                className="field field-compact"
+                              >
+                                <span>{screeningAnswer.question}</span>
+                                <textarea
+                                  rows={3}
+                                  value={screeningAnswer.answer}
+                                  onChange={(event) =>
+                                    updateScreeningAnswer(application.id, index, event.target.value)
+                                  }
+                                />
+                                <div className="field-actions">
+                                  <button
+                                    type="button"
+                                    className="button-secondary button-small"
+                                    onClick={() =>
+                                      void handleAssistScreeningAnswer(
+                                        application.id,
+                                        screeningAnswer.question,
+                                        screeningAnswer.answer,
+                                        index,
+                                      )
+                                    }
+                                    disabled={busyKey === `ai-screening-${application.id}-${index}`}
+                                  >
+                                    <AiAssistLabel
+                                      busy={busyKey === `ai-screening-${application.id}-${index}`}
+                                      hasExistingText={screeningAnswer.answer.trim().length > 0}
+                                    />
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
                           {latestRun ? (
+                            <div className="draft-run-summary">
+                              <span className="count-badge">
+                                {latestRun.preview_summary.autofill_ready_count} autofill-ready
+                              </span>
+                              <span className="count-badge">
+                                {latestRun.preview_summary.review_required_count} review items
+                              </span>
+                            </div>
+                          ) : null}
+                          {latestRun || linkedJob ? (
+                            <div className="field-actions">
+                              {latestRun ? (
+                                <button
+                                  type="button"
+                                  className="button-secondary button-small"
+                                  onClick={() => jumpToSection('worker-run-section')}
+                                >
+                                  Open latest run
+                                </button>
+                              ) : null}
+                              {linkedJob ? (
+                                <button
+                                  type="button"
+                                  className="button-secondary button-small"
+                                  onClick={() => jumpToJob(linkedJob.id)}
+                                >
+                                  Open linked role
+                                </button>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          <div className="button-row draft-actions">
+                            <button
+                              className="button-secondary"
+                              onClick={() =>
+                                void handleWorker(application.id, {
+                                  dryRun: true,
+                                  confirmSubmit: false,
+                                })
+                              }
+                              disabled={busyKey === previewKey}
+                            >
+                              {busyKey === previewKey ? 'Generating preview...' : 'Preview Autofill'}
+                            </button>
+                            <button
+                              onClick={() =>
+                                void handleWorker(application.id, {
+                                  dryRun: false,
+                                  confirmSubmit: true,
+                                })
+                              }
+                              disabled={busyKey === submitKey}
+                            >
+                              {busyKey === submitKey ? 'Submitting...' : 'Submit Application'}
+                            </button>
                             <button
                               type="button"
-                              className="button-secondary button-small"
-                              onClick={() => jumpToSection('worker-run-section')}
+                              className="button-danger"
+                              onClick={() => void handleDeleteApplication(application.id)}
+                              disabled={busyKey === `delete-application-${application.id}`}
                             >
-                              Open latest run
+                              {busyKey === `delete-application-${application.id}`
+                                ? 'Deleting...'
+                                : 'Delete Draft'}
                             </button>
-                          ) : null}
-                          {linkedJob ? (
-                            <button
-                              type="button"
-                              className="button-secondary button-small"
-                              onClick={() => jumpToJob(linkedJob.id)}
-                            >
-                              Open linked role
-                            </button>
-                          ) : null}
+                          </div>
                         </div>
                       ) : null}
-                      <div className="button-row draft-actions">
-                        <button
-                          className="button-secondary"
-                          onClick={() =>
-                            void handleWorker(application.id, {
-                              dryRun: true,
-                              confirmSubmit: false,
-                            })
-                          }
-                          disabled={busyKey === previewKey}
-                        >
-                          {busyKey === previewKey ? 'Generating preview...' : 'Preview Autofill'}
-                        </button>
-                        <button
-                          onClick={() =>
-                            void handleWorker(application.id, {
-                              dryRun: false,
-                              confirmSubmit: true,
-                            })
-                          }
-                          disabled={busyKey === submitKey}
-                        >
-                          {busyKey === submitKey ? 'Submitting...' : 'Submit Application'}
-                        </button>
-                        <button
-                          type="button"
-                          className="button-danger"
-                          onClick={() => void handleDeleteApplication(application.id)}
-                          disabled={busyKey === `delete-application-${application.id}`}
-                        >
-                          {busyKey === `delete-application-${application.id}`
-                            ? 'Deleting...'
-                            : 'Delete Draft'}
-                        </button>
-                      </div>
-                    </article>
-                  )
-                })}
-              </div>
-            ) : (
-              <div className="empty-state">
-                <p>No application drafts yet.</p>
-                <span>
-                  Drafts appear here after you shortlist a role and generate tailored application
-                  content.
-                </span>
-              </div>
-            )}
-          </div>
+                      </article>
+                    )
+                  })}
+                </div>
+              ) : (
+                <div className="empty-state">
+                  <p>No application drafts yet.</p>
+                  <span>
+                    Drafts appear here after you shortlist a role and generate tailored application
+                    content.
+                  </span>
+                </div>
+              )}
+            </div>
         </article>
 
         <article className="panel panel-section" id="worker-run-section">
@@ -1663,234 +2029,276 @@ function App() {
               {lastWorkerRun ? formatWorkerStatus(lastWorkerRun.status) : 'No run yet'}
             </span>
           </div>
-          <div className="panel-body panel-body-compact">
+          <div className="panel-body panel-body-compact" id="worker-run-body">
             {lastWorkerRun ? (
               <div className="worker-results">
-                <div className="worker-meta-grid">
-                  <p>
-                    Platform: <strong>{lastWorkerRun.platform}</strong>
-                  </p>
-                  <p>
-                    Status: <strong>{formatWorkerStatus(lastWorkerRun.status)}</strong>
-                  </p>
-                  <p>
-                    Previewed fields: <strong>{lastWorkerRun.preview_summary.total_fields}</strong>
-                  </p>
-                  <p>
-                    Needs review: <strong>{lastWorkerRun.preview_summary.review_required_count}</strong>
-                  </p>
+                <div
+                  className="draft-card-header panel-header-toggle"
+                  role="button"
+                  tabIndex={0}
+                  aria-expanded={!isLastWorkerRunCollapsed}
+                  aria-controls={`worker-run-details-${lastWorkerRun.id}`}
+                  onClick={() =>
+                    setCollapsedWorkerRunIds((current) => ({
+                      ...current,
+                      [lastWorkerRun.id]: !current[lastWorkerRun.id],
+                    }))
+                  }
+                  onKeyDown={(event) =>
+                    handleToggleHeaderKeyDown(event, () =>
+                      setCollapsedWorkerRunIds((current) => ({
+                        ...current,
+                        [lastWorkerRun.id]: !current[lastWorkerRun.id],
+                      })),
+                    )
+                  }
+                >
+                  <div className="draft-card-title-group">
+                    <h3>{currentRunJob?.title ?? `Run #${lastWorkerRun.id}`}</h3>
+                    <p className="draft-card-company">
+                      {currentRunJob
+                        ? `${currentRunJob.company} · ${formatJobSource(currentRunJob.source)}`
+                        : `Platform ${lastWorkerRun.platform}`}
+                    </p>
+                  </div>
+                  <div className="panel-header-meta">
+                    <span className={getWorkerStatusBadgeClassName(lastWorkerRun.status)}>
+                      {formatWorkerStatus(lastWorkerRun.status)}
+                    </span>
+                    <span className="collapse-indicator">
+                      {isLastWorkerRunCollapsed ? 'Show' : 'Hide'}
+                    </span>
+                  </div>
                 </div>
-                <div className="worker-badge-row">
-                  <span className="count-badge">
-                    {lastWorkerRun.preview_summary.autofill_ready_count} autofill-ready
-                  </span>
-                  <span className="count-badge">
-                    {lastWorkerRun.preview_summary.unresolved_required_count} unresolved required
-                  </span>
-                  <span className="count-badge">
-                    {lastWorkerRun.preview_summary.llm_suggestions_count} LLM suggestions
-                  </span>
-                </div>
-                {lastWorkerRun.screenshot_path ? (
-                  <div className="worker-artifact-card">
-                    <div className="worker-artifact-copy">
-                      <span className="signal-label">Screenshot</span>
-                      <p
-                        className="muted worker-artifact-name"
-                        title={lastWorkerRun.screenshot_path}
-                      >
-                        {formatArtifactFileName(lastWorkerRun.screenshot_path)}
+                {!isLastWorkerRunCollapsed ? (
+                  <div className="worker-results-body" id={`worker-run-details-${lastWorkerRun.id}`}>
+                    <div className="worker-meta-grid">
+                      <p>
+                        Platform: <strong>{lastWorkerRun.platform}</strong>
+                      </p>
+                      <p>
+                        Status: <strong>{formatWorkerStatus(lastWorkerRun.status)}</strong>
+                      </p>
+                      <p>
+                        Previewed fields: <strong>{lastWorkerRun.preview_summary.total_fields}</strong>
+                      </p>
+                      <p>
+                        Needs review: <strong>{lastWorkerRun.preview_summary.review_required_count}</strong>
                       </p>
                     </div>
+                    <div className="worker-badge-row">
+                      <span className="count-badge">
+                        {lastWorkerRun.preview_summary.autofill_ready_count} autofill-ready
+                      </span>
+                      <span className="count-badge">
+                        {lastWorkerRun.preview_summary.unresolved_required_count} unresolved required
+                      </span>
+                      <span className="count-badge">
+                        {lastWorkerRun.preview_summary.llm_suggestions_count} LLM suggestions
+                      </span>
+                    </div>
+                    {lastWorkerRun.screenshot_path ? (
+                      <div className="worker-artifact-card">
+                        <div className="worker-artifact-copy">
+                          <span className="signal-label">Screenshot</span>
+                          <p
+                            className="muted worker-artifact-name"
+                            title={lastWorkerRun.screenshot_path}
+                          >
+                            {formatArtifactFileName(lastWorkerRun.screenshot_path)}
+                          </p>
+                        </div>
+                        <a
+                          href={buildApiUrl(`/api/applications/runs/${lastWorkerRun.id}/screenshot`)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="button-secondary button-small inline-link-button"
+                        >
+                          Open screenshot
+                        </a>
+                      </div>
+                    ) : (
+                      <p className="muted worker-path">Screenshot unavailable.</p>
+                    )}
                     <a
-                      href={buildApiUrl(`/api/applications/runs/${lastWorkerRun.id}/screenshot`)}
+                      href={lastWorkerRun.target_url}
                       target="_blank"
                       rel="noreferrer"
-                      className="button-secondary button-small inline-link-button"
+                      className="button-secondary inline-link-button"
                     >
-                      Open screenshot
+                      Open application page
                     </a>
-                  </div>
-                ) : (
-                  <p className="muted worker-path">Screenshot unavailable.</p>
-                )}
-                <a
-                  href={lastWorkerRun.target_url}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="button-secondary inline-link-button"
-                >
-                  Open application page
-                </a>
-                {currentRunApplicationId || currentRunJob ? (
-                  <div className="worker-link-row">
-                    {currentRunApplicationId ? (
-                      <button
-                        type="button"
-                        className="button-secondary button-small"
-                        onClick={() => jumpToDraft(currentRunApplicationId)}
-                      >
-                        Open linked draft
-                      </button>
+                    {currentRunApplicationId || currentRunJob ? (
+                      <div className="worker-link-row">
+                        {currentRunApplicationId ? (
+                          <button
+                            type="button"
+                            className="button-secondary button-small"
+                            onClick={() => jumpToDraft(currentRunApplicationId)}
+                          >
+                            Open linked draft
+                          </button>
+                        ) : null}
+                        {currentRunJob ? (
+                          <button
+                            type="button"
+                            className="button-secondary button-small"
+                            onClick={() => jumpToJob(currentRunJob.id)}
+                          >
+                            Open linked role
+                          </button>
+                        ) : null}
+                      </div>
                     ) : null}
-                    {currentRunJob ? (
-                      <button
-                        type="button"
-                        className="button-secondary button-small"
-                        onClick={() => jumpToJob(currentRunJob.id)}
-                      >
-                        Open linked role
-                      </button>
-                    ) : null}
-                  </div>
-                ) : null}
 
-                {lastWorkerRun.review_items.length > 0 ? (
-                  <div className="worker-review-section">
-                    <h3>Review required</h3>
-                    <div className="review-grid">
-                      {lastWorkerRun.review_items.map((field) => (
-                        <article key={field.field_id} className="review-card">
-                          <div className="review-card-header">
-                            <div>
-                              <strong>{getFieldDisplayName(field)}</strong>
-                              <p className="muted">
-                                {field.required ? 'Required' : 'Optional'} ·{' '}
-                                {field.section || field.canonical_label || 'Application question'}
-                              </p>
-                            </div>
-                            <span className="count-badge">
-                              {field.answer_source ? formatAnswerSource(field.answer_source) : 'Needs input'}
+                    {lastWorkerRun.review_items.length > 0 ? (
+                      <div className="worker-review-section">
+                        <h3>Review required</h3>
+                        <div className="review-grid">
+                          {lastWorkerRun.review_items.map((field) => (
+                            <article key={field.field_id} className="review-card">
+                              <div className="review-card-header">
+                                <div>
+                                  <strong>{getFieldDisplayName(field)}</strong>
+                                  <p className="muted">
+                                    {field.required ? 'Required' : 'Optional'} ·{' '}
+                                    {field.section || field.canonical_label || 'Application question'}
+                                  </p>
+                                </div>
+                                <span className="count-badge">
+                                  {field.answer_source ? formatAnswerSource(field.answer_source) : 'Needs input'}
+                                </span>
+                              </div>
+                              {field.review_reason ? <p className="muted">{field.review_reason}</p> : null}
+                              {renderFieldEditor({
+                                field,
+                                applicationId: currentRunApplicationId,
+                                reviewValueLookup,
+                                updateReviewOverride,
+                              })}
+                              {currentRunApplicationId && canAssistField(field) ? (
+                                <div className="field-actions">
+                                  <button
+                                    type="button"
+                                    className="button-secondary button-small"
+                                    onClick={() =>
+                                      void handleAssistReviewField(currentRunApplicationId, field)
+                                    }
+                                    disabled={
+                                      busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
+                                    }
+                                  >
+                                    <AiAssistLabel
+                                      busy={
+                                        busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
+                                      }
+                                      hasExistingText={
+                                        (
+                                          reviewValueLookup[field.field_id] ??
+                                          field.answer_value ??
+                                          ''
+                                        ).trim().length > 0
+                                      }
+                                    />
+                                  </button>
+                                </div>
+                              ) : null}
+                              <div className="review-card-footer">
+                                <span>Confidence {formatConfidence(field.answer_confidence)}</span>
+                                <span>{field.classification_source || 'Unclassified'}</span>
+                              </div>
+                            </article>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {autofillReadyFields.length > 0 ? (
+                      <div className="worker-ready-section">
+                        <h3>Autofill ready</h3>
+                        <div className="tag-row">
+                          {autofillReadyFields.slice(0, 8).map((field) => (
+                            <span key={field.field_id} className="tag">
+                              {getFieldDisplayName(field)}
                             </span>
-                          </div>
-                          {field.review_reason ? <p className="muted">{field.review_reason}</p> : null}
-                          {renderFieldEditor({
-                            field,
-                            applicationId: currentRunApplicationId,
-                            reviewValueLookup,
-                            updateReviewOverride,
-                          })}
-                          {currentRunApplicationId && canAssistField(field) ? (
-                            <div className="field-actions">
-                              <button
-                                type="button"
-                                className="button-secondary button-small"
-                                onClick={() =>
-                                  void handleAssistReviewField(currentRunApplicationId, field)
-                                }
-                                disabled={
-                                  busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
-                                }
-                              >
-                                <AiAssistLabel
-                                  busy={
-                                    busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
-                                  }
-                                  hasExistingText={
-                                    (
-                                      reviewValueLookup[field.field_id] ??
-                                      field.answer_value ??
-                                      ''
-                                    ).trim().length > 0
-                                  }
-                                />
-                              </button>
-                            </div>
-                          ) : null}
-                          <div className="review-card-footer">
-                            <span>Confidence {formatConfidence(field.answer_confidence)}</span>
-                            <span>{field.classification_source || 'Unclassified'}</span>
-                          </div>
-                        </article>
-                      ))}
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
+
+                    {lastWorkerRun.actions.length > 0 ? (
+                      <div>
+                        <h3>Planned actions</h3>
+                        <ul>
+                          {lastWorkerRun.actions.map((action) => (
+                            <li key={`${action.field}-${action.selector}`}>
+                              {action.field} via <code>{action.selector}</code>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    ) : null}
+
+                    <div>
+                      <h3>Logs</h3>
+                      <ul>
+                        {lastWorkerRun.logs.map((log) => (
+                          <li key={log}>{log}</li>
+                        ))}
+                      </ul>
                     </div>
+
+                    {currentRunApplicationId ? (
+                      <div className="button-row worker-cta-row">
+                        <button
+                          className="button-secondary"
+                          onClick={() =>
+                            void handleWorker(currentRunApplicationId, {
+                              dryRun: true,
+                              confirmSubmit: false,
+                            })
+                          }
+                          disabled={busyKey === `preview-${currentRunApplicationId}`}
+                        >
+                          {busyKey === `preview-${currentRunApplicationId}`
+                            ? 'Refreshing preview...'
+                            : 'Refresh Preview'}
+                        </button>
+                        <button
+                          onClick={() =>
+                            void handleWorker(currentRunApplicationId, {
+                              dryRun: false,
+                              confirmSubmit: true,
+                            })
+                          }
+                          disabled={busyKey === `submit-${currentRunApplicationId}`}
+                        >
+                          {busyKey === `submit-${currentRunApplicationId}`
+                            ? 'Submitting...'
+                            : 'Submit With Approved Answers'}
+                        </button>
+                        <button
+                          type="button"
+                          className="button-danger"
+                          onClick={() => void handleDeleteLastWorkerRun()}
+                          disabled={busyKey === `delete-run-${lastWorkerRun.id}`}
+                        >
+                          {busyKey === `delete-run-${lastWorkerRun.id}` ? 'Deleting...' : 'Delete This Run'}
+                        </button>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
-
-                {autofillReadyFields.length > 0 ? (
-                  <div className="worker-ready-section">
-                    <h3>Autofill ready</h3>
-                    <div className="tag-row">
-                      {autofillReadyFields.slice(0, 8).map((field) => (
-                        <span key={field.field_id} className="tag">
-                          {getFieldDisplayName(field)}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-
-                {lastWorkerRun.actions.length > 0 ? (
-                  <div>
-                    <h3>Planned actions</h3>
-                    <ul>
-                      {lastWorkerRun.actions.map((action) => (
-                        <li key={`${action.field}-${action.selector}`}>
-                          {action.field} via <code>{action.selector}</code>
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-
-                <div>
-                  <h3>Logs</h3>
-                  <ul>
-                    {lastWorkerRun.logs.map((log) => (
-                      <li key={log}>{log}</li>
-                    ))}
-                  </ul>
+              </div>
+              ) : (
+                <div className="empty-state">
+                  <p>No worker run yet.</p>
+                  <span>
+                    Preview a draft to inspect semantic field extraction, question matching, and the
+                    final approval gate before submission.
+                  </span>
                 </div>
-
-                {currentRunApplicationId ? (
-                  <div className="button-row worker-cta-row">
-                    <button
-                      className="button-secondary"
-                      onClick={() =>
-                        void handleWorker(currentRunApplicationId, {
-                          dryRun: true,
-                          confirmSubmit: false,
-                        })
-                      }
-                      disabled={busyKey === `preview-${currentRunApplicationId}`}
-                    >
-                      {busyKey === `preview-${currentRunApplicationId}`
-                        ? 'Refreshing preview...'
-                        : 'Refresh Preview'}
-                    </button>
-                    <button
-                      onClick={() =>
-                        void handleWorker(currentRunApplicationId, {
-                          dryRun: false,
-                          confirmSubmit: true,
-                        })
-                      }
-                      disabled={busyKey === `submit-${currentRunApplicationId}`}
-                    >
-                      {busyKey === `submit-${currentRunApplicationId}`
-                        ? 'Submitting...'
-                        : 'Submit With Approved Answers'}
-                    </button>
-                    <button
-                      type="button"
-                      className="button-danger"
-                      onClick={() => void handleDeleteLastWorkerRun()}
-                      disabled={busyKey === `delete-run-${lastWorkerRun.id}`}
-                    >
-                      {busyKey === `delete-run-${lastWorkerRun.id}` ? 'Deleting...' : 'Delete This Run'}
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="empty-state">
-                <p>No worker run yet.</p>
-                <span>
-                  Preview a draft to inspect semantic field extraction, question matching, and the
-                  final approval gate before submission.
-                </span>
-              </div>
-            )}
+              )}
           </div>
         </article>
       </section>
@@ -2229,10 +2637,42 @@ function normalizeProfileEditor(value: Partial<CandidateProfilePayload>) {
   }
 }
 
+function normalizeSearchPreferences(value: Partial<SearchPreferencesPayload>) {
+  return {
+    ...emptySearchPreferences,
+    ...value,
+    target_titles: normalizeSearchPreferenceItems(value.target_titles),
+    target_responsibilities: normalizeSearchPreferenceItems(value.target_responsibilities),
+    locations: normalizeSearchPreferenceItems(value.locations),
+    workplace_modes: Array.isArray(value.workplace_modes) ? value.workplace_modes : [],
+    include_keywords: normalizeSearchPreferenceItems(value.include_keywords),
+    exclude_keywords: normalizeSearchPreferenceItems(value.exclude_keywords),
+    companies_include: normalizeSearchPreferenceItems(value.companies_include),
+    companies_exclude: normalizeSearchPreferenceItems(value.companies_exclude),
+    result_limit:
+      typeof value.result_limit === 'number' && Number.isFinite(value.result_limit)
+        ? Math.min(25, Math.max(1, Math.round(value.result_limit)))
+        : emptySearchPreferences.result_limit,
+  }
+}
+
 function splitLines(value: string): string[] {
   return value
     .split('\n')
     .map((item) => item.trim())
+    .filter(Boolean)
+}
+
+function splitEditorLines(value: string): string[] {
+  return value.replace(/\r/g, '').split('\n')
+}
+
+function normalizeSearchPreferenceItems(values: string[] | undefined) {
+  if (!Array.isArray(values)) {
+    return []
+  }
+  return values
+    .map((value) => value.trim())
     .filter(Boolean)
 }
 
@@ -2266,6 +2706,12 @@ function getFitScoreCardStyle(score: number): CSSProperties {
 }
 
 function formatJobSource(source: string) {
+  if (source === 'generic') {
+    return 'WEB'
+  }
+  if (source === 'ashbyhq') {
+    return 'ASHBY'
+  }
   return source.toUpperCase()
 }
 
@@ -2299,7 +2745,11 @@ function getWorkplaceType(job: JobLeadResponse): Exclude<WorkplaceFilterValue, '
   if (workplaceSignal.includes('remote')) {
     return 'remote'
   }
-  if (workplaceSignal.includes('on-site') || workplaceSignal.includes('on site')) {
+  if (
+    workplaceSignal.includes('on-site') ||
+    workplaceSignal.includes('on site') ||
+    workplaceSignal.includes('onsite')
+  ) {
     return 'on-site'
   }
   return null
@@ -2310,4 +2760,15 @@ function getErrorMessage(error: unknown) {
     return error.message
   }
   return 'Something went wrong while contacting the API.'
+}
+
+function formatDiscoveryErrorMessage(error: unknown) {
+  const message = getErrorMessage(error).trim()
+  if (!message) {
+    return 'AI web discovery failed. Try again shortly or use Manual ATS Discovery.'
+  }
+  if (/^ai web discovery/i.test(message)) {
+    return message
+  }
+  return `AI web discovery failed. ${message}`
 }

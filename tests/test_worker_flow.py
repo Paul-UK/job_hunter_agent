@@ -166,6 +166,31 @@ def test_worker_preview_handles_lever_form_and_flags_missing_answers(client, mon
     assert any(field["field_id"] == "question-why-role" for field in worker_run["review_items"])
 
 
+def test_worker_preview_uses_platform_for_web_discovered_greenhouse_job(client, monkeypatch):
+    monkeypatch.setattr("apps.worker.main.get_llm_client", lambda: FakeLLMClient())
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/web-discovered-1",
+        discovery_method="gemini_grounded_search",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    fixture_html = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={"dry_run": True, "fixture_html": fixture_html},
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["platform"] == "greenhouse"
+    assert worker_run["target_url"] == "https://boards.greenhouse.io/example-company/jobs/web-discovered-1"
+
+
 def test_worker_submit_handles_custom_choice_widgets(client):
     seed_profile(client)
     job_id = create_job(
@@ -195,6 +220,54 @@ def test_worker_submit_handles_custom_choice_widgets(client):
     assert worker_run["status"] == "submitted"
     assert any(action["mode"] == "choose" for action in worker_run["actions"])
     assert any(action["mode"] == "click" for action in worker_run["actions"])
+
+
+def test_worker_submit_handles_hidden_native_radio_fieldset(client, monkeypatch):
+    monkeypatch.setattr("apps.worker.main.get_llm_client", lambda: FakeLLMClient())
+    seed_profile(client)
+    job_id = create_job(
+        source="ashbyhq",
+        url="https://jobs.ashbyhq.com/example-company/hidden-native-radio/application",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    preview_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={"dry_run": True, "fixture_html": hidden_native_choice_fixture_html()},
+    )
+    assert preview_response.status_code == 200
+    preview_run = preview_response.json()
+    assert preview_run["status"] == "awaiting_answers"
+
+    source_field = next(
+        field
+        for field in preview_run["review_items"]
+        if field["label"] == "How did you hear about ElevenLabs?"
+    )
+
+    submit_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": hidden_native_choice_fixture_html(),
+            "answer_overrides": [
+                {"field_id": source_field["field_id"], "value": "News article"},
+            ],
+        },
+    )
+    assert submit_response.status_code == 200
+    worker_run = submit_response.json()
+
+    assert worker_run["status"] == "submitted"
+    radio_action = next(
+        action for action in worker_run["actions"] if action["field_id"] == source_field["field_id"]
+    )
+    assert radio_action["mode"] == "click"
+    assert radio_action["selector"] == 'label[for="hear-about-news"]'
 
 
 def test_worker_skips_submit_when_custom_choice_cannot_be_applied(client):
@@ -305,7 +378,7 @@ def seed_profile(client) -> None:
     assert profile_response.status_code == 200
 
 
-def create_job(*, source: str, url: str) -> int:
+def create_job(*, source: str, url: str, discovery_method: str = "direct") -> int:
     with SessionLocal() as session:
         job = JobLead(
             source=source,
@@ -318,6 +391,7 @@ def create_job(*, source: str, url: str) -> int:
             description="Support AI applications with Python and SQL.",
             requirements=["Python", "SQL"],
             metadata_json={},
+            discovery_method=discovery_method,
             score=88.0,
             score_details={"summary": "High fit"},
             research={},
@@ -379,6 +453,38 @@ def custom_choice_fixture_html() -> str:
             })
           }
         </script>
+      </body>
+    </html>
+    """
+
+
+def hidden_native_choice_fixture_html() -> str:
+    return """
+    <html>
+      <body>
+        <form onsubmit="event.preventDefault(); document.body.innerHTML = '<main><h1>Thank you for applying</h1><p>Your application has been submitted.</p></main>';">
+          <fieldset>
+            <label class="question-title" for="hear-about-elevenlabs">
+              How did you hear about ElevenLabs?
+            </label>
+            <div>
+              <span><input type="radio" id="hear-about-user" name="hear-about" required style="position:absolute; opacity:0; width:0; height:0;" /></span>
+              <label for="hear-about-user">I'm a user</label>
+            </div>
+            <div>
+              <span><input type="radio" id="hear-about-news" name="hear-about" style="position:absolute; opacity:0; width:0; height:0;" /></span>
+              <label for="hear-about-news">News article</label>
+            </div>
+            <div>
+              <span><input type="radio" id="hear-about-job-board" name="hear-about" style="position:absolute; opacity:0; width:0; height:0;" /></span>
+              <label for="hear-about-job-board">Job board</label>
+            </div>
+          </fieldset>
+          <label for="hear-about-detail">If other, please specify below</label>
+          <input id="hear-about-detail" name="hear-about-detail" placeholder="Type here..." />
+
+          <button type="submit">Submit Application</button>
+        </form>
       </body>
     </html>
     """
