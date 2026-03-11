@@ -1,7 +1,11 @@
 import type {
+  ApplicationDraftResponse,
+  ApplicationDraftAssistResponse,
+  BulkDeleteResponse,
   CandidateProfilePayload,
   CandidateProfileResponse,
   DashboardResponse,
+  DeleteResponse,
   JobLeadResponse,
   ScreeningAnswerPayload,
   WorkerAnswerOverride,
@@ -77,6 +81,12 @@ export function updateProfile(payload: CandidateProfilePayload) {
   })
 }
 
+export function deleteProfileSource(sourceId: number) {
+  return request<DeleteResponse>(`/api/profile/sources/${sourceId}`, {
+    method: 'DELETE',
+  })
+}
+
 export function discoverGreenhouse(identifiers: string[]) {
   return request<JobLeadResponse[]>('/api/jobs/discover/greenhouse', {
     method: 'POST',
@@ -108,15 +118,44 @@ export function captureLinkedinLead(payload: {
   })
 }
 
-export function runResearch(jobId: number) {
-  return request(`/api/jobs/${jobId}/research`, {
+export function createDraft(jobId: number) {
+  return request<ApplicationDraftResponse>(`/api/jobs/${jobId}/draft`, {
     method: 'POST',
   })
 }
 
-export function createDraft(jobId: number) {
-  return request(`/api/jobs/${jobId}/draft`, {
+export function deleteJobLead(jobId: number) {
+  return request<DeleteResponse>(`/api/jobs/${jobId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function bulkDeleteJobLeads(jobIds: number[]) {
+  return request<BulkDeleteResponse>('/api/jobs/bulk-delete', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ job_ids: jobIds }),
+  })
+}
+
+export function assistApplicationDraft(
+  applicationId: number,
+  payload: {
+    target: 'cover_note' | 'question_answer'
+    question?: string
+    current_text?: string
+    persist?: boolean
+  },
+) {
+  return request<ApplicationDraftAssistResponse>(`/api/applications/${applicationId}/assist`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      target: payload.target,
+      question: payload.question,
+      current_text: payload.current_text,
+      persist: payload.persist ?? true,
+    }),
   })
 }
 
@@ -142,5 +181,17 @@ export function runWorker(
       cover_note: payload.cover_note,
       screening_answers: payload.screening_answers,
     }),
+  })
+}
+
+export function deleteApplicationDraft(applicationId: number) {
+  return request<DeleteResponse>(`/api/applications/${applicationId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function deleteWorkerRun(runId: number) {
+  return request<DeleteResponse>(`/api/applications/runs/${runId}`, {
+    method: 'DELETE',
   })
 }

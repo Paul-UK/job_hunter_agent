@@ -9,12 +9,14 @@ from apps.api.app.config import settings
 from apps.api.app.db import get_session
 from apps.api.app.schemas import (
     CandidateProfileResponse,
+    DeleteResponse,
     ProfileSourcePayload,
     ProfileUpdateRequest,
 )
 from apps.api.app.services.profile_sources.linkedin_profile import parse_linkedin_source
 from apps.api.app.services.resume_parser import extract_text_from_upload, parse_resume_text
 from apps.api.app.services.storage import (
+    delete_profile_source,
     get_latest_profile,
     list_profile_sources,
     save_profile_source,
@@ -32,6 +34,18 @@ def read_profile(session: Session = Depends(get_session)) -> CandidateProfileRes
 @router.get("/sources", response_model=list[ProfileSourcePayload])
 def read_profile_sources(session: Session = Depends(get_session)) -> list[ProfileSourcePayload]:
     return list_profile_sources(session)
+
+
+@router.delete("/sources/{source_id}", response_model=DeleteResponse)
+def remove_profile_source(source_id: int, session: Session = Depends(get_session)) -> DeleteResponse:
+    deleted_counts = delete_profile_source(session, source_id)
+    if deleted_counts is None:
+        raise HTTPException(status_code=404, detail="Profile source not found.")
+    return DeleteResponse(
+        entity="profile_source",
+        deleted_id=source_id,
+        deleted_counts=deleted_counts,
+    )
 
 
 @router.post("/cv", response_model=CandidateProfileResponse)

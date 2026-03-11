@@ -11,18 +11,24 @@ from apps.api.app.db import get_session
 from apps.api.app.models import ApplicationDraft, JobLead
 from apps.api.app.schemas import (
     ApplicationDraftResponse,
+    BulkDeleteResponse,
+    DeleteResponse,
     JobDiscoveryRequest,
+    JobLeadBulkDeleteRequest,
     JobLeadResponse,
     LinkedinLeadRequest,
     ResearchResponse,
 )
 from apps.api.app.services.company_research import research_company
+from apps.api.app.services.company_research import research_needs_refresh
 from apps.api.app.services.drafting import build_application_draft
 from apps.api.app.services.job_sources.greenhouse import fetch_greenhouse_jobs
 from apps.api.app.services.job_sources.lever import fetch_lever_jobs
 from apps.api.app.services.job_sources.linkedin import create_linkedin_lead
 from apps.api.app.services.matching import rank_job
 from apps.api.app.services.storage import (
+    delete_job_lead,
+    delete_job_leads,
     get_latest_profile,
     get_profile_payload,
     list_jobs,
@@ -114,7 +120,7 @@ def draft_application(
     ranking = rank_job(profile_payload, job_to_payload(job))
     job.score = ranking.score
     job.score_details = ranking.model_dump(mode="json")
-    if not job.research:
+    if research_needs_refresh(job.research):
         job.research = research_company(job.company, job.url)
 
     draft_payload = build_application_draft(
@@ -135,6 +141,36 @@ def draft_application(
     session.commit()
     session.refresh(draft)
     return draft
+
+
+@router.post("/bulk-delete", response_model=BulkDeleteResponse)
+def bulk_remove_jobs(
+    payload: JobLeadBulkDeleteRequest,
+    session: Session = Depends(get_session),
+) -> BulkDeleteResponse:
+    if not payload.job_ids:
+        raise HTTPException(status_code=400, detail="Provide at least one job ID to delete.")
+
+    deleted_ids, deleted_counts = delete_job_leads(session, payload.job_ids)
+    if not deleted_ids:
+        raise HTTPException(status_code=404, detail="No matching job leads were found.")
+    return BulkDeleteResponse(
+        entity="job_leads",
+        deleted_ids=deleted_ids,
+        deleted_counts=deleted_counts,
+    )
+
+
+@router.delete("/{job_id}", response_model=DeleteResponse)
+def remove_job(job_id: int, session: Session = Depends(get_session)) -> DeleteResponse:
+    deleted_counts = delete_job_lead(session, job_id)
+    if deleted_counts is None:
+        raise HTTPException(status_code=404, detail="Job lead not found.")
+    return DeleteResponse(
+        entity="job_lead",
+        deleted_id=job_id,
+        deleted_counts=deleted_counts,
+    )
 
 
 def _save_and_score_job(session: Session, payload: dict) -> JobLead:

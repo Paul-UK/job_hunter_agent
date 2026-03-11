@@ -34,6 +34,7 @@ class CandidateProfilePayload(BaseModel):
 
 
 class ProfileSourcePayload(BaseModel):
+    id: int | None = None
     source_type: Literal["cv", "linkedin"]
     source_label: str
     confidence: dict[str, float] = Field(default_factory=dict)
@@ -61,6 +62,10 @@ class ProfileUpdateRequest(CandidateProfilePayload):
 class JobDiscoveryRequest(BaseModel):
     identifiers: list[str] = Field(default_factory=list)
     include_questions: bool = False
+
+
+class JobLeadBulkDeleteRequest(BaseModel):
+    job_ids: list[int] = Field(default_factory=list)
 
 
 class LinkedinLeadRequest(BaseModel):
@@ -124,6 +129,32 @@ class ApplicationDraftResponse(BaseModel):
     resume_bullets: list[str] = Field(default_factory=list)
     screening_answers: list[ScreeningAnswerPayload] = Field(default_factory=list)
     status: str
+
+
+class ApplicationDraftAssistRequest(BaseModel):
+    target: Literal["cover_note", "question_answer"]
+    question: str | None = None
+    current_text: str | None = None
+    persist: bool = True
+
+
+class ApplicationDraftAssistResponse(BaseModel):
+    text: str
+    confidence: float
+    reasoning: str
+    updated_draft: ApplicationDraftResponse | None = None
+
+
+class DeleteResponse(BaseModel):
+    entity: Literal["job_lead", "application_draft", "worker_run", "profile_source"]
+    deleted_id: int
+    deleted_counts: dict[str, int] = Field(default_factory=dict)
+
+
+class BulkDeleteResponse(BaseModel):
+    entity: Literal["job_leads"]
+    deleted_ids: list[int] = Field(default_factory=list)
+    deleted_counts: dict[str, int] = Field(default_factory=dict)
 
 
 class WorkerFieldOption(BaseModel):

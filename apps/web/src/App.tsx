@@ -2,12 +2,17 @@ import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from
 import './App.css'
 import jobHunterLogo from './assets/PTxagentic_job_hunter_logo.png'
 import {
+  assistApplicationDraft,
+  bulkDeleteJobLeads,
   captureLinkedinLead,
   createDraft,
+  deleteApplicationDraft,
+  deleteJobLead,
+  deleteProfileSource,
+  deleteWorkerRun,
   discoverGreenhouse,
   discoverLever,
   getDashboard,
-  runResearch,
   runWorker,
   updateProfile,
   uploadCv,
@@ -66,6 +71,9 @@ function App() {
   const [lastWorkerRun, setLastWorkerRun] = useState<WorkerRunResponse | null>(null)
   const [draftEditors, setDraftEditors] = useState<Record<number, DraftEditorState>>({})
   const [reviewOverrides, setReviewOverrides] = useState<Record<number, Record<string, string>>>({})
+  const [pendingDraftJumpId, setPendingDraftJumpId] = useState<number | null>(null)
+  const [highlightedDraftId, setHighlightedDraftId] = useState<number | null>(null)
+  const [expandedJobIds, setExpandedJobIds] = useState<Record<number, boolean>>({})
   const [shortlistFilters, setShortlistFilters] = useState<{
     minScore: number
     location: string
@@ -82,7 +90,7 @@ function App() {
 
   useEffect(() => {
     if (dashboard?.profile?.merged_profile) {
-      setProfileEditor(dashboard.profile.merged_profile)
+      setProfileEditor(normalizeProfileEditor(dashboard.profile.merged_profile))
     }
   }, [dashboard?.profile])
 
@@ -91,7 +99,10 @@ function App() {
       return
     }
     setDraftEditors((current) => {
-      const next = { ...current }
+      const applicationIds = new Set(dashboard.applications.map((application) => application.id))
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([applicationId]) => applicationIds.has(Number(applicationId))),
+      )
       for (const application of dashboard.applications) {
         if (!next[application.id]) {
           next[application.id] = createDraftEditorState(application)
@@ -99,11 +110,30 @@ function App() {
       }
       return next
     })
+    setReviewOverrides((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(([applicationId]) =>
+          dashboard.applications.some((application) => application.id === Number(applicationId)),
+        ),
+      ),
+    )
   }, [dashboard?.applications])
 
   useEffect(() => {
+    if (!dashboard?.jobs) {
+      return
+    }
+    const jobIds = new Set(dashboard.jobs.map((job) => job.id))
+    setExpandedJobIds((current) =>
+      Object.fromEntries(
+        Object.entries(current).filter(([jobId]) => jobIds.has(Number(jobId))),
+      ),
+    )
+  }, [dashboard?.jobs])
+
+  useEffect(() => {
     const latestRun = dashboard?.worker_runs?.[0] ?? null
-    if (latestRun && latestRun.id !== lastWorkerRun?.id) {
+    if ((latestRun?.id ?? null) !== (lastWorkerRun?.id ?? null)) {
       setLastWorkerRun(latestRun)
     }
   }, [dashboard?.worker_runs, lastWorkerRun?.id])
@@ -123,6 +153,39 @@ function App() {
       return { ...current, [applicationDraftId]: existing }
     })
   }, [lastWorkerRun?.application_draft_id, lastWorkerRun?.id, lastWorkerRun?.review_items])
+
+  useEffect(() => {
+    if (!pendingDraftJumpId) {
+      return
+    }
+
+    const draftElement = document.getElementById(`application-draft-${pendingDraftJumpId}`)
+    if (!draftElement) {
+      return
+    }
+
+    draftElement.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    window.setTimeout(() => {
+      const firstEditor = draftElement.querySelector('textarea, input') as
+        | HTMLTextAreaElement
+        | HTMLInputElement
+        | null
+      firstEditor?.focus()
+    }, 220)
+    setHighlightedDraftId(pendingDraftJumpId)
+    setPendingDraftJumpId(null)
+  }, [pendingDraftJumpId, dashboard?.applications])
+
+  useEffect(() => {
+    if (!highlightedDraftId) {
+      return
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setHighlightedDraftId((current) => (current === highlightedDraftId ? null : current))
+    }, 2200)
+    return () => window.clearTimeout(timeoutId)
+  }, [highlightedDraftId])
 
   const rankedJobs = useMemo(() => {
     return [...(dashboard?.jobs ?? [])].sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
@@ -166,6 +229,7 @@ function App() {
     shortlistFilters.minScore > 0 ||
     shortlistFilters.location.trim().length > 0 ||
     shortlistFilters.workplace !== 'all'
+  const canBulkDeleteFilteredJobs = hasShortlistFilters && shortlist.length > 0
 
   async function refreshDashboard(nextMessage = 'Dashboard is up to date.') {
     try {
@@ -229,6 +293,20 @@ function App() {
     })
   }
 
+  async function handleDeleteProfileSource(sourceId: number, sourceLabel: string) {
+    const confirmed = window.confirm(
+      `Delete imported source "${sourceLabel}"? This will remove it from the merged profile state.`,
+    )
+    if (!confirmed) {
+      return
+    }
+
+    await runAction(`delete-source-${sourceId}`, async () => {
+      const result = await deleteProfileSource(sourceId)
+      return `Deleted imported profile source "${sourceLabel}". ${buildDeleteStatusMessage(result)}`
+    })
+  }
+
   async function handleDiscovery(source: 'greenhouse' | 'lever') {
     await runAction(`discover-${source}`, async () => {
       const identifiers =
@@ -269,18 +347,142 @@ function App() {
     })
   }
 
-  async function handleResearch(jobId: number) {
-    await runAction(`research-${jobId}`, async () => {
-      await runResearch(jobId)
-      return `Ran company research for job ${jobId}.`
+  async function handleDraft(jobId: number) {
+    const busyLabel = `draft-${jobId}`
+    try {
+      setBusyKey(busyLabel)
+      const draft = await createDraft(jobId)
+      setPendingDraftJumpId(draft.id)
+      await refreshDashboard(`Created an application draft for job ${jobId}. Jumped to the draft editor.`)
+    } catch (error) {
+      setStatusMessage(getErrorMessage(error))
+    } finally {
+      setBusyKey(null)
+    }
+  }
+
+  async function handleDeleteJob(jobId: number) {
+    const confirmed = window.confirm(
+      'Delete this job lead? Any linked drafts and worker runs will be removed as well.',
+    )
+    if (!confirmed) {
+      return
+    }
+
+    await runAction(`delete-job-${jobId}`, async () => {
+      const result = await deleteJobLead(jobId)
+      return buildDeleteStatusMessage(result)
     })
   }
 
-  async function handleDraft(jobId: number) {
-    await runAction(`draft-${jobId}`, async () => {
-      await createDraft(jobId)
-      return `Created an application draft for job ${jobId}.`
+  async function handleDeleteFilteredJobs() {
+    if (!hasShortlistFilters) {
+      setStatusMessage('Apply at least one shortlist filter before using bulk delete.')
+      return
+    }
+    if (shortlist.length === 0) {
+      setStatusMessage('No filtered leads match the current filters.')
+      return
+    }
+
+    const confirmed = window.confirm(
+      `Delete ${shortlist.length} filtered lead${shortlist.length === 1 ? '' : 's'}? Linked drafts and worker runs will be removed as well.`,
+    )
+    if (!confirmed) {
+      return
+    }
+
+    await runAction('delete-filtered-jobs', async () => {
+      const result = await bulkDeleteJobLeads(shortlist.map((job) => job.id))
+      return buildBulkDeleteStatusMessage(result)
     })
+  }
+
+  function toggleJobExpansion(jobId: number) {
+    setExpandedJobIds((current) => ({
+      ...current,
+      [jobId]: !current[jobId],
+    }))
+  }
+
+  async function handleDeleteApplication(applicationId: number) {
+    const confirmed = window.confirm(
+      'Delete this application draft? Related worker runs will be removed too.',
+    )
+    if (!confirmed) {
+      return
+    }
+
+    await runAction(`delete-application-${applicationId}`, async () => {
+      const result = await deleteApplicationDraft(applicationId)
+      return buildDeleteStatusMessage(result)
+    })
+  }
+
+  async function handleDeleteLastWorkerRun() {
+    if (!lastWorkerRun) {
+      return
+    }
+
+    const confirmed = window.confirm(
+      'Delete this worker run? The draft will stay in place.',
+    )
+    if (!confirmed) {
+      return
+    }
+
+    await runAction(`delete-run-${lastWorkerRun.id}`, async () => {
+      const result = await deleteWorkerRun(lastWorkerRun.id)
+      return buildDeleteStatusMessage(result)
+    })
+  }
+
+  function applyUpdatedDraft(updatedDraft: ApplicationDraftResponse) {
+    setDashboard((current) => {
+      if (!current) {
+        return current
+      }
+      return {
+        ...current,
+        applications: current.applications.map((application) =>
+          application.id === updatedDraft.id ? updatedDraft : application,
+        ),
+      }
+    })
+    setDraftEditors((current) => ({
+      ...current,
+      [updatedDraft.id]: createDraftEditorState(updatedDraft),
+    }))
+  }
+
+  async function requestDraftAssist(
+    busyKeyValue: string,
+    applicationId: number,
+    payload: {
+      target: 'cover_note' | 'question_answer'
+      question?: string
+      current_text?: string
+      persist?: boolean
+    },
+    onComplete?: (text: string) => void,
+  ) {
+    try {
+      setBusyKey(busyKeyValue)
+      const result = await assistApplicationDraft(applicationId, payload)
+      if (result.updated_draft) {
+        applyUpdatedDraft(result.updated_draft)
+      }
+      onComplete?.(result.text)
+      const subject =
+        payload.target === 'cover_note'
+          ? 'cover note'
+          : (payload.question ?? 'question answer').toLowerCase()
+      setStatusMessage(`AI refreshed the ${subject}. ${result.reasoning}`)
+    } catch (error) {
+      setStatusMessage(getErrorMessage(error))
+    } finally {
+      setBusyKey(null)
+    }
   }
 
   async function handleWorker(
@@ -306,6 +508,55 @@ function App() {
       seedReviewOverrides(result, setReviewOverrides)
       return buildWorkerStatusMessage(result)
     })
+  }
+
+  async function handleAssistCoverNote(applicationId: number) {
+    const editor = draftEditors[applicationId] ?? createDraftEditorStateFromId(applicationId, dashboard)
+    if (!editor) {
+      setStatusMessage(`Draft ${applicationId} is no longer available.`)
+      return
+    }
+    await requestDraftAssist(`ai-cover-${applicationId}`, applicationId, {
+      target: 'cover_note',
+      current_text: editor.cover_note,
+      persist: true,
+    })
+  }
+
+  async function handleAssistScreeningAnswer(
+    applicationId: number,
+    question: string,
+    answer: string,
+    index: number,
+  ) {
+    await requestDraftAssist(`ai-screening-${applicationId}-${index}`, applicationId, {
+      target: 'question_answer',
+      question,
+      current_text: answer,
+      persist: true,
+    })
+  }
+
+  async function handleAssistReviewField(applicationId: number, field: WorkerFieldState) {
+    const currentValue =
+      reviewOverrides[applicationId]?.[field.field_id] ?? field.answer_value ?? ''
+    const target = field.canonical_key === 'cover_note' ? 'cover_note' : 'question_answer'
+    const question =
+      target === 'question_answer'
+        ? field.question_text || field.label || getFieldDisplayName(field)
+        : undefined
+
+    await requestDraftAssist(
+      `ai-field-${applicationId}-${field.field_id}`,
+      applicationId,
+      {
+        target,
+        question,
+        current_text: currentValue,
+        persist: true,
+      },
+      (text) => updateReviewOverride(applicationId, field.field_id, text),
+    )
   }
 
   function updateProfileLink(linkType: 'linkedin' | 'github', value: string) {
@@ -460,9 +711,21 @@ function App() {
           <div className="source-list">
             <h3>Imported Sources</h3>
             {(dashboard?.profile_sources ?? []).map((source) => (
-              <div key={`${source.source_type}-${source.source_label}`} className="source-chip">
-                <strong>{source.source_type.toUpperCase()}</strong>
-                <span>{source.source_label}</span>
+              <div key={source.id ?? `${source.source_type}-${source.source_label}`} className="source-chip">
+                <div className="source-chip-meta">
+                  <strong>{source.source_type.toUpperCase()}</strong>
+                  <span>{source.source_label}</span>
+                </div>
+                {source.id ? (
+                  <button
+                    type="button"
+                    className="button-danger button-small"
+                    onClick={() => void handleDeleteProfileSource(source.id!, source.source_label)}
+                    disabled={busyKey === `delete-source-${source.id}`}
+                  >
+                    {busyKey === `delete-source-${source.id}` ? 'Deleting...' : 'Delete'}
+                  </button>
+                ) : null}
               </div>
             ))}
           </div>
@@ -737,109 +1000,142 @@ function App() {
               </div>
             </div>
             {hasShortlistFilters ? (
-              <button
-                type="button"
-                className="button-secondary shortlist-clear"
-                onClick={() =>
-                  setShortlistFilters({
-                    minScore: 0,
-                    location: '',
-                    workplace: 'all',
-                  })
-                }
-              >
-                Clear filters
-              </button>
+              <div className="shortlist-actions">
+                <button
+                  type="button"
+                  className="button-secondary shortlist-clear"
+                  onClick={() =>
+                    setShortlistFilters({
+                      minScore: 0,
+                      location: '',
+                      workplace: 'all',
+                    })
+                  }
+                >
+                  Clear filters
+                </button>
+                <button
+                  type="button"
+                  className="button-danger shortlist-clear"
+                  onClick={() => void handleDeleteFilteredJobs()}
+                  disabled={!canBulkDeleteFilteredJobs || busyKey === 'delete-filtered-jobs'}
+                >
+                  {busyKey === 'delete-filtered-jobs'
+                    ? 'Deleting...'
+                    : `Delete ${shortlist.length} filtered ${shortlist.length === 1 ? 'lead' : 'leads'}`}
+                </button>
+              </div>
             ) : null}
           </div>
           {shortlist.length > 0 ? (
             <div className="card-grid card-grid-panel">
-              {shortlist.map((job) => (
-                <article key={job.id} className="job-card">
-                  <div className="job-card-header">
-                    <div className="job-card-title-block">
-                      <h3>{job.title}</h3>
-                      <p className="job-card-company">
-                        {job.company} · {formatJobSource(job.source)}
-                      </p>
-                    </div>
-                    <div
-                      className="job-score-card"
-                      aria-label={`Fit score ${Math.round(job.score ?? 0)} out of 100`}
-                    >
-                      <span className="job-score-label">Fit score</span>
-                      <strong className="job-score-value">{Math.round(job.score ?? 0)}</strong>
-                      <span className="job-score-band">{getFitLabel(job.score ?? 0)}</span>
-                    </div>
-                  </div>
-                  <div className="job-meta-row">
-                    <span>{job.location || 'Location not listed'}</span>
-                    {getWorkplaceLabel(job) ? <span>{getWorkplaceLabel(job)}</span> : null}
-                  </div>
-                  <p className="job-summary">
-                    {job.score_details?.summary ??
-                      'Run discovery after uploading a CV to see ranking details.'}
-                  </p>
-                  {(job.score_details?.matched_signals?.length ?? 0) > 0 ? (
-                    <div className="signal-block">
-                      <span className="signal-label">Why it matches</span>
-                      <div className="tag-row">
-                        {(job.score_details?.matched_signals ?? []).slice(0, 4).map((signal) => (
-                          <span key={signal} className="tag">
-                            {signal}
-                          </span>
-                        ))}
+              {shortlist.map((job) => {
+                const isExpanded = expandedJobIds[job.id] ?? false
+                return (
+                  <article
+                    key={job.id}
+                    className={`job-card ${isExpanded ? 'job-card-expanded' : 'job-card-collapsed'}`}
+                  >
+                    <div className="job-card-header">
+                      <div className="job-card-title-block">
+                        <h3>{job.title}</h3>
+                        <p className="job-card-company">
+                          {job.company} · {formatJobSource(job.source)}
+                        </p>
+                      </div>
+                      <div
+                        className="job-score-card"
+                        aria-label={`Fit score ${Math.round(job.score ?? 0)} out of 100`}
+                      >
+                        <span className="job-score-label">Fit score</span>
+                        <strong className="job-score-value">{Math.round(job.score ?? 0)}</strong>
+                        <span className="job-score-band">{getFitLabel(job.score ?? 0)}</span>
                       </div>
                     </div>
-                  ) : (
-                    <div className="signal-block">
-                      <span className="signal-label">Key skills</span>
-                      <div className="tag-row">
-                        {(job.score_details?.matched_skills ?? []).slice(0, 4).map((skill) => (
-                          <span key={skill} className="tag">
-                            {skill}
-                          </span>
-                        ))}
+                    <div className="job-meta-row">
+                      <span>{job.location || 'Location not listed'}</span>
+                      {getWorkplaceLabel(job) ? <span>{getWorkplaceLabel(job)}</span> : null}
+                    </div>
+                    <p className={`job-summary ${isExpanded ? '' : 'job-summary-collapsed'}`.trim()}>
+                      {job.score_details?.summary ??
+                        'Run discovery after uploading a CV to see ranking details.'}
+                    </p>
+                    {isExpanded ? (
+                      <>
+                        {(job.score_details?.matched_signals?.length ?? 0) > 0 ? (
+                          <div className="signal-block">
+                            <span className="signal-label">Why it matches</span>
+                            <div className="tag-row">
+                              {(job.score_details?.matched_signals ?? []).slice(0, 4).map((signal) => (
+                                <span key={signal} className="tag">
+                                  {signal}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="signal-block">
+                            <span className="signal-label">Key skills</span>
+                            <div className="tag-row">
+                              {(job.score_details?.matched_skills ?? []).slice(0, 4).map((skill) => (
+                                <span key={skill} className="tag">
+                                  {skill}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {(job.score_details?.missing_signals?.length ?? 0) > 0 ? (
+                          <div className="warning-box">
+                            <span className="signal-label">Watchouts</span>
+                            <p>{(job.score_details?.missing_signals ?? []).slice(0, 2).join(' · ')}</p>
+                          </div>
+                        ) : null}
+                        {job.research?.github_summary || job.research?.website_summary ? (
+                          <div className="research-box">
+                            <strong>Research</strong>
+                            <p>{job.research.website_summary || job.research.github_summary}</p>
+                          </div>
+                        ) : null}
+                      </>
+                    ) : null}
+                    <div className="button-row job-actions">
+                      <a
+                        href={job.url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="button-secondary"
+                      >
+                        Open posting
+                      </a>
+                      <button
+                        onClick={() => void handleDraft(job.id)}
+                        disabled={busyKey === `draft-${job.id}`}
+                      >
+                        {busyKey === `draft-${job.id}` ? 'Drafting...' : 'Create Draft'}
+                      </button>
+                      <button
+                        type="button"
+                        className="button-secondary"
+                        onClick={() => toggleJobExpansion(job.id)}
+                      >
+                        {isExpanded ? 'Hide details' : 'Show details'}
+                      </button>
+                    </div>
+                    {isExpanded ? (
+                      <div className="job-card-footer-actions">
+                        <button
+                          type="button"
+                          className="button-danger"
+                          onClick={() => void handleDeleteJob(job.id)}
+                          disabled={busyKey === `delete-job-${job.id}`}
+                        >
+                          {busyKey === `delete-job-${job.id}` ? 'Deleting...' : 'Delete Lead'}
+                        </button>
                       </div>
-                    </div>
-                  )}
-                  {(job.score_details?.missing_signals?.length ?? 0) > 0 ? (
-                    <div className="warning-box">
-                      <span className="signal-label">Watchouts</span>
-                      <p>{(job.score_details?.missing_signals ?? []).slice(0, 2).join(' · ')}</p>
-                    </div>
-                  ) : null}
-                  {job.research?.github_summary || job.research?.website_summary ? (
-                    <div className="research-box">
-                      <strong>Research</strong>
-                      <p>{job.research.website_summary || job.research.github_summary}</p>
-                    </div>
-                  ) : null}
-                  <div className="button-row job-actions">
-                    <a
-                      href={job.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="button-secondary"
-                    >
-                      Open posting
-                    </a>
-                    <button
-                      className="button-secondary"
-                      onClick={() => void handleResearch(job.id)}
-                      disabled={busyKey === `research-${job.id}`}
-                    >
-                      {busyKey === `research-${job.id}` ? 'Researching...' : 'Run Research'}
-                    </button>
-                    <button
-                      onClick={() => void handleDraft(job.id)}
-                      disabled={busyKey === `draft-${job.id}`}
-                    >
-                      {busyKey === `draft-${job.id}` ? 'Drafting...' : 'Create Draft'}
-                    </button>
-                  </div>
-                </article>
-              ))}
+                    ) : null}
+                  </article>
+              )})}
             </div>
           ) : rankedJobs.length > 0 ? (
             <div className="empty-state">
@@ -885,7 +1181,11 @@ function App() {
                   const submitKey = `submit-${application.id}`
 
                   return (
-                    <article key={application.id} className="draft-card">
+                    <article
+                      key={application.id}
+                      id={`application-draft-${application.id}`}
+                      className={`draft-card ${highlightedDraftId === application.id ? 'draft-card-highlighted' : ''}`}
+                    >
                       <div className="draft-card-header">
                         <div className="draft-card-title-group">
                           <h3>{linkedJob?.title ?? `Draft #${application.id}`}</h3>
@@ -909,9 +1209,23 @@ function App() {
                           onChange={(event) => updateDraftCoverNote(application.id, event.target.value)}
                         />
                       </label>
+                      <div className="field-actions">
+                        <button
+                          type="button"
+                          className="button-secondary button-small"
+                          onClick={() => void handleAssistCoverNote(application.id)}
+                          disabled={busyKey === `ai-cover-${application.id}`}
+                        >
+                          {busyKey === `ai-cover-${application.id}`
+                            ? 'Drafting...'
+                            : draftEditor.cover_note.trim()
+                              ? 'Improve with AI'
+                              : 'Draft with AI'}
+                        </button>
+                      </div>
                       <div className="screening-answer-list">
                         {draftEditor.screening_answers.map((screeningAnswer, index) => (
-                          <label
+                          <div
                             key={`${application.id}-${screeningAnswer.question}`}
                             className="field field-compact"
                           >
@@ -923,7 +1237,28 @@ function App() {
                                 updateScreeningAnswer(application.id, index, event.target.value)
                               }
                             />
-                          </label>
+                            <div className="field-actions">
+                              <button
+                                type="button"
+                                className="button-secondary button-small"
+                                onClick={() =>
+                                  void handleAssistScreeningAnswer(
+                                    application.id,
+                                    screeningAnswer.question,
+                                    screeningAnswer.answer,
+                                    index,
+                                  )
+                                }
+                                disabled={busyKey === `ai-screening-${application.id}-${index}`}
+                              >
+                                {busyKey === `ai-screening-${application.id}-${index}`
+                                  ? 'Drafting...'
+                                  : screeningAnswer.answer.trim()
+                                    ? 'Improve with AI'
+                                    : 'Draft with AI'}
+                              </button>
+                            </div>
+                          </div>
                         ))}
                       </div>
                       {latestRun ? (
@@ -959,6 +1294,16 @@ function App() {
                           disabled={busyKey === submitKey}
                         >
                           {busyKey === submitKey ? 'Submitting...' : 'Submit Application'}
+                        </button>
+                        <button
+                          type="button"
+                          className="button-danger"
+                          onClick={() => void handleDeleteApplication(application.id)}
+                          disabled={busyKey === `delete-application-${application.id}`}
+                        >
+                          {busyKey === `delete-application-${application.id}`
+                            ? 'Deleting...'
+                            : 'Delete Draft'}
                         </button>
                       </div>
                     </article>
@@ -1055,6 +1400,24 @@ function App() {
                             reviewValueLookup,
                             updateReviewOverride,
                           })}
+                          {currentRunApplicationId && canAssistField(field) ? (
+                            <div className="field-actions">
+                              <button
+                                type="button"
+                                className="button-secondary button-small"
+                                onClick={() =>
+                                  void handleAssistReviewField(currentRunApplicationId, field)
+                                }
+                                disabled={
+                                  busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
+                                }
+                              >
+                                {busyKey === `ai-field-${currentRunApplicationId}-${field.field_id}`
+                                  ? 'Drafting...'
+                                  : 'Draft with AI'}
+                              </button>
+                            </div>
+                          ) : null}
                           <div className="review-card-footer">
                             <span>Confidence {formatConfidence(field.answer_confidence)}</span>
                             <span>{field.classification_source || 'Unclassified'}</span>
@@ -1128,6 +1491,14 @@ function App() {
                       {busyKey === `submit-${currentRunApplicationId}`
                         ? 'Submitting...'
                         : 'Submit With Approved Answers'}
+                    </button>
+                    <button
+                      type="button"
+                      className="button-danger"
+                      onClick={() => void handleDeleteLastWorkerRun()}
+                      disabled={busyKey === `delete-run-${lastWorkerRun.id}`}
+                    >
+                      {busyKey === `delete-run-${lastWorkerRun.id}` ? 'Deleting...' : 'Delete This Run'}
                     </button>
                   </div>
                 ) : null}
@@ -1271,6 +1642,36 @@ function buildWorkerStatusMessage(result: WorkerRunResponse) {
   return 'Worker run completed.'
 }
 
+function buildDeleteStatusMessage(result: {
+  entity: 'job_lead' | 'application_draft' | 'worker_run' | 'profile_source'
+  deleted_counts: Record<string, number>
+}) {
+  if (result.entity === 'job_lead') {
+    const draftCount = result.deleted_counts.application_drafts ?? 0
+    const runCount = result.deleted_counts.worker_runs ?? 0
+    return `Deleted job lead and cleaned up ${draftCount} draft${draftCount === 1 ? '' : 's'} plus ${runCount} worker run${runCount === 1 ? '' : 's'}.`
+  }
+  if (result.entity === 'application_draft') {
+    const runCount = result.deleted_counts.worker_runs ?? 0
+    return `Deleted application draft and removed ${runCount} worker run${runCount === 1 ? '' : 's'}.`
+  }
+  if (result.entity === 'profile_source') {
+    const remainingCount = result.deleted_counts.remaining_sources ?? 0
+    return `${remainingCount} imported source${remainingCount === 1 ? '' : 's'} remaining.`
+  }
+  return 'Deleted worker run.'
+}
+
+function buildBulkDeleteStatusMessage(result: {
+  deleted_counts: Record<string, number>
+  deleted_ids: number[]
+}) {
+  const leadCount = result.deleted_counts.job_leads ?? result.deleted_ids.length
+  const draftCount = result.deleted_counts.application_drafts ?? 0
+  const runCount = result.deleted_counts.worker_runs ?? 0
+  return `Deleted ${leadCount} filtered lead${leadCount === 1 ? '' : 's'} and cleaned up ${draftCount} draft${draftCount === 1 ? '' : 's'} plus ${runCount} worker run${runCount === 1 ? '' : 's'}.`
+}
+
 function getFieldDisplayName(field: WorkerFieldState) {
   return field.label || field.question_text || field.canonical_label || field.field_id
 }
@@ -1315,6 +1716,25 @@ function formatWorkerStatus(status: string) {
     return 'Failed'
   }
   return status.replace(/_/g, ' ')
+}
+
+function canAssistField(field: WorkerFieldState) {
+  if (field.options.length > 0) {
+    return false
+  }
+  return !['select', 'radio', 'checkbox', 'file'].includes(field.field_type)
+}
+
+function normalizeProfileEditor(value: Partial<CandidateProfilePayload>) {
+  return {
+    ...emptyProfile,
+    ...value,
+    skills: Array.isArray(value.skills) ? value.skills : [],
+    achievements: Array.isArray(value.achievements) ? value.achievements : [],
+    experiences: Array.isArray(value.experiences) ? value.experiences : [],
+    education: Array.isArray(value.education) ? value.education : [],
+    links: value.links ?? {},
+  }
 }
 
 function splitLines(value: string): string[] {

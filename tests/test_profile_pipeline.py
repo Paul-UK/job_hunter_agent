@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 
 def test_cv_and_linkedin_merge_into_profile(client):
     cv_text = """
@@ -51,6 +53,65 @@ def test_cv_and_linkedin_merge_into_profile(client):
     assert dashboard_response.status_code == 200
     dashboard = dashboard_response.json()
     assert len(dashboard["profile_sources"]) == 2
+
+
+def test_delete_cv_source_removes_resume_and_keeps_remaining_linkedin_profile(client):
+    cv_text = """
+    Paul Example
+    AI Product Engineer
+    paul@example.com
+    Paris, France
+
+    Summary
+    Builder focused on AI products, automation, and applied machine learning.
+
+    Skills
+    Python, FastAPI, SQL, React
+    """.strip()
+
+    cv_response = client.post(
+        "/api/profile/cv",
+        files={"file": ("resume.txt", cv_text.encode("utf-8"), "text/plain")},
+    )
+    assert cv_response.status_code == 200
+    resume_path = Path(cv_response.json()["merged_profile"]["links"]["resume_path"])
+    assert resume_path.exists()
+
+    linkedin_text = """
+    Paul Example
+    Staff AI Engineer
+    About
+    Shipping AI systems for workflow acceleration.
+
+    Skills
+    Python
+    LLM
+    Playwright
+    """.strip()
+    linkedin_response = client.post("/api/profile/linkedin", data={"text": linkedin_text})
+    assert linkedin_response.status_code == 200
+
+    dashboard_response = client.get("/api/dashboard")
+    source_id = next(
+        source["id"]
+        for source in dashboard_response.json()["profile_sources"]
+        if source["source_type"] == "cv"
+    )
+
+    delete_response = client.delete(f"/api/profile/sources/{source_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["entity"] == "profile_source"
+    assert resume_path.exists() is False
+
+    refreshed_dashboard = client.get("/api/dashboard")
+    assert refreshed_dashboard.status_code == 200
+    dashboard = refreshed_dashboard.json()
+
+    assert len(dashboard["profile_sources"]) == 1
+    assert dashboard["profile_sources"][0]["source_type"] == "linkedin"
+    assert "resume_path" not in dashboard["profile"]["merged_profile"]["links"]
+    assert "LLM" in dashboard["profile"]["merged_profile"]["skills"]
+    assert "React" not in dashboard["profile"]["merged_profile"]["skills"]
 
 
 def test_manual_profile_update_reranks_existing_jobs(client):
