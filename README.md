@@ -8,8 +8,9 @@ The product is intentionally human-in-the-loop. It helps with profile parsing, l
 
 - Parse a CV from `PDF`, `DOCX`, or plain text into a structured profile.
 - Merge additional context from pasted LinkedIn text or exported LinkedIn HTML.
-- Discover roles from Greenhouse and Lever, plus manual LinkedIn lead capture.
-- Rank jobs using title alignment, skills, location, and seniority/scope signals.
+- Seed editable job-search intent from the merged profile so discovery and ranking share the same target titles, responsibilities, locations, and keywords.
+- Discover roles manually from Greenhouse, Lever, and Ashby by company identifier, or use experimental Gemini-grounded web discovery for direct ATS job pages.
+- Rank jobs using title alignment, skills, location, intent alignment, and seniority/scope signals.
 - Generate tailored application drafts with summaries, cover notes, and screening answers.
 - Improve long-form answers and cover notes with an optional Gemini layer.
 - Run a semantic Playwright worker that extracts fields from ATS pages, classifies them, resolves answers, and pauses when review is needed.
@@ -26,9 +27,9 @@ flowchart LR
     W[apps/web<br/>React + TypeScript + Vite]
     A[apps/api<br/>FastAPI orchestration layer]
     DB[(SQLite)]
-    SRC[Job sources<br/>Greenhouse / Lever / manual LinkedIn]
+    SRC[Job sources<br/>Greenhouse / Lever / Ashby / grounded web discovery]
     PROF[Profile ingestion<br/>CV / LinkedIn parsing]
-    MATCH[Ranking + company research + drafting]
+    MATCH[Search intent + ranking + company research + drafting]
     LLM[Optional Gemini layer]
     WORKER[apps/worker<br/>Playwright semantic autofill worker]
     ATS[ATS application page]
@@ -49,7 +50,7 @@ flowchart LR
 ### `apps/web`
 
 - React 19 + TypeScript + Vite dashboard.
-- Covers profile intake, ATS discovery, shortlist review, draft editing, AI assist, worker preview, run review, screenshots, and deletion flows.
+- Covers profile intake, manual ATS discovery, experimental AI web discovery, shortlist review, draft editing, AI assist, worker preview, run review, screenshots, and deletion flows.
 - Uses typed API helpers from `apps/web/src/api.ts`.
 - Keeps applied roles visible but de-emphasized to avoid duplicate work.
 
@@ -95,14 +96,15 @@ job_hunter_agent/
 ## End-To-End Workflow
 
 1. Upload a CV and optionally merge LinkedIn content into one candidate profile.
-2. Discover roles from Greenhouse, Lever, or manual LinkedIn capture.
-3. Rank jobs against the profile and review them in the shortlist.
-4. Create a draft for a role or reopen an existing one from the shortlist.
-5. Edit cover notes and screening answers manually or with AI assist.
-6. Run `Preview Autofill` to inspect extracted fields, unresolved questions, selector choices, and planned actions.
-7. Approve or override hard questions.
-8. Run final submit only when the worker has enough confidence to proceed.
-9. Review the resulting worker run, logs, screenshot, and confirmation state.
+2. Review or edit the seeded search intent for titles, responsibilities, locations, workplace modes, and keywords.
+3. Discover roles either through manual ATS discovery (`Greenhouse`, `Lever`, `Ashby`) or experimental AI web discovery constrained to direct ATS job pages.
+4. Rank jobs against the profile and search intent, then review them in the shortlist.
+5. Create a draft for a role or reopen an existing one from the shortlist.
+6. Edit cover notes and screening answers manually or with AI assist.
+7. Run `Preview Autofill` to inspect extracted fields, unresolved questions, selector choices, and planned actions.
+8. Approve or override hard questions.
+9. Run final submit only when the worker has enough confidence to proceed.
+10. Review the resulting worker run, logs, screenshot, and confirmation state.
 
 ## Semantic Worker Pipeline
 
@@ -174,7 +176,7 @@ Individual inputs such as CV upload or LinkedIn import. These can be deleted ind
 
 ### `JobLead`
 
-Discovered or manually captured opportunity. Stores source metadata, ranking output, research context, and can reflect the most recently recorded application state in the workspace.
+Discovered opportunity from manual ATS sourcing, AI grounded web discovery, or direct capture flows. Stores source metadata, discovery provenance, ranking output, research context, and can reflect the most recently recorded application state in the workspace.
 
 ### `ApplicationDraft`
 
@@ -190,7 +192,7 @@ Immutable snapshot of one preview or submission attempt. Stores extracted fields
 - Worker runs default to preview/dry-run unless submit is explicitly requested.
 - Final submission still requires an explicit submit action from the dashboard.
 - If a field cannot be applied reliably, the worker stops before final submit.
-- LinkedIn is used for enrichment and manual lead capture, not blind platform automation.
+- LinkedIn is used for profile enrichment; job discovery is centered on ATS-hosted apply flows and reviewable AI search results.
 - Delete operations exist across the workspace so data stays manageable.
 - Submission confirmation is evidence-based, not click-based.
 
@@ -200,12 +202,13 @@ Gemini is optional, not required.
 
 When configured, it is used for:
 
+- grounded web discovery of direct ATS job pages
 - ambiguous field classification
 - long-form answer drafting
 - cover note improvement
 - screening answer improvement
 
-When disabled or unavailable, the system falls back to deterministic behavior where possible.
+When disabled or unavailable, the system falls back to deterministic behavior where possible, and manual ATS discovery remains available even if AI discovery is degraded.
 
 ## Quick Start
 
@@ -254,6 +257,9 @@ Key values from `.env.example`:
 - `JOB_AGENT_GEMINI_API_KEY`: optional Gemini API key
 - `JOB_AGENT_GEMINI_MODEL`: Gemini model name
 - `JOB_AGENT_GEMINI_TIMEOUT_SECONDS`: Gemini request timeout
+- `JOB_AGENT_GEMINI_DISCOVERY_MODEL`: Gemini model dedicated to AI web discovery
+- `JOB_AGENT_GEMINI_DISCOVERY_TIMEOUT_SECONDS`: timeout for grounded web discovery calls
+- `JOB_AGENT_GEMINI_DISCOVERY_MAX_ATTEMPTS`: retry count for flaky grounded discovery responses
 - `VITE_API_BASE_URL`: optional explicit frontend API base URL. Leave blank in local dev to use the Vite `/api` proxy.
 
 ## Key API Surfaces
@@ -277,6 +283,8 @@ Key values from `.env.example`:
 - `GET /api/jobs`
 - `POST /api/jobs/discover/greenhouse`
 - `POST /api/jobs/discover/lever`
+- `POST /api/jobs/discover/ashby`
+- `POST /api/jobs/discover/web`
 - `POST /api/jobs/discover/linkedin`
 - `POST /api/jobs/{job_id}/research`
 - `POST /api/jobs/{job_id}/draft`
@@ -327,7 +335,8 @@ cd apps/web && npm run lint
 
 ## Current Scope And Limits
 
-- Best-covered ATS platforms today are Greenhouse and Lever.
+- Best-covered ATS platforms today are Greenhouse, Lever, and Ashby.
+- AI web discovery is intentionally constrained to direct ATS job pages and can still degrade when Gemini grounded search is slow or returns poor structure.
 - The worker handles both native inputs and many custom ARIA-style widgets, but highly bespoke async widgets and multi-step application flows can still require manual review.
 - Submission confirmation currently relies on detectable success signals on the resulting page; some ATS variants may still fall back to `submit_clicked` even if the submission likely worked.
 - The product is optimized to reduce repetitive application effort, not to invisibly spray applications without inspection.
