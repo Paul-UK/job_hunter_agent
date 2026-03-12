@@ -4,6 +4,7 @@ import sys
 import types as py_types
 
 import pytest
+from bs4 import BeautifulSoup
 from sqlalchemy import select
 
 from apps.api.app.config import settings
@@ -19,6 +20,7 @@ from apps.api.app.services.job_discovery.service import (
     RetryableWebDiscoveryError,
     WebDiscoveryError,
     WebDiscoveryResult,
+    _extract_supported_apply_links,
     discover_jobs_from_web,
 )
 
@@ -234,6 +236,37 @@ def test_gemini_grounded_search_client_falls_back_to_candidate_parts_when_text_m
     assert result.candidates[0].title == "Support Engineer"
     assert result.search_queries == ["support engineer london"]
     assert result.source_urls == ["https://boards.greenhouse.io/example/jobs/123"]
+
+
+def test_extract_supported_apply_links_uses_page_context_for_generic_apply_links():
+    soup = BeautifulSoup(
+        """
+        <html>
+          <head>
+            <title>Senior Manager, Support Engineering - Europe | Sanity</title>
+          </head>
+          <body>
+            <h1>Senior Manager, Support Engineering - Europe</h1>
+            <a href="https://jobs.ashbyhq.com/sanity/ec701d24-cda8-47f4-a58c-a89747f4da23/application">
+              Apply for this position
+            </a>
+          </body>
+        </html>
+        """,
+        "html.parser",
+    )
+
+    assert _extract_supported_apply_links(
+        soup,
+        base_url="https://www.sanity.io/careers/senior-manager-support-engineering-europe",
+        page_title="Senior Manager, Support Engineering - Europe | Sanity",
+        heading="Senior Manager, Support Engineering - Europe",
+    ) == [
+        (
+            "https://jobs.ashbyhq.com/sanity/ec701d24-cda8-47f4-a58c-a89747f4da23",
+            "Senior Manager, Support Engineering - Europe",
+        )
+    ]
 
 
 def test_discover_jobs_from_web_retries_transient_gemini_failures(monkeypatch):
@@ -466,6 +499,10 @@ def test_discover_jobs_from_web_falls_back_to_grounded_source_urls(monkeypatch):
 
     monkeypatch.setattr(GeminiGroundedSearchClient, "search_jobs", fake_search_jobs)
     monkeypatch.setattr("apps.api.app.services.job_discovery.service._fetch_job_page", fake_fetch_job_page)
+    monkeypatch.setattr(
+        "apps.api.app.services.job_discovery.service._discover_recovery_links",
+        lambda _url, *, recovery_link_cache: [],
+    )
 
     result = discover_jobs_from_web(
         profile=CandidateProfilePayload(
@@ -499,6 +536,173 @@ def test_discover_jobs_from_web_falls_back_to_grounded_source_urls(monkeypatch):
     assert result.jobs[0]["metadata_json"]["discovery"]["grounded_url"] == (
         "https://jobs.ashbyhq.com/swap/afb66699-257b-482f-993c-8002277a76d6?locationId=39ac34e7-074d-47f8-a523-cebc96cbb99d"
     )
+
+
+def test_discover_jobs_from_web_recovers_stale_greenhouse_urls_from_board_links(monkeypatch):
+    candidate_url = "https://job-boards.greenhouse.io/anthropic/jobs/4999999999"
+    recovered_url = "https://job-boards.greenhouse.io/anthropic/jobs/4980460008"
+
+    def fake_search_jobs(self, *, profile, search_preferences):
+        assert profile.headline == "Research Engineer"
+        assert search_preferences.target_titles == ["Research Engineer"]
+        return GroundedSearchResult(
+            candidates=[
+                GroundedJobCandidate(
+                    company="Anthropic",
+                    title="Research Engineer, Production Model Post-Training - London",
+                    url=candidate_url,
+                    location="London, UK",
+                    employment_type="Full-time",
+                    source_hint="greenhouse",
+                    description_snippet="Production model post-training role.",
+                    why_match="Relevant research engineering experience.",
+                )
+            ],
+            search_queries=["research engineer anthropic london greenhouse"],
+            source_urls=[],
+        )
+
+    def fake_fetch_job_page(url: str):
+        if url == candidate_url:
+            return None
+        if url == recovered_url:
+            return FetchedJobPage(
+                final_url=recovered_url,
+                canonical_url=recovered_url,
+                page_title="Research Engineer, Production Model Post-Training - London",
+                heading="Research Engineer, Production Model Post-Training - London",
+                company="Anthropic",
+                location="London, UK",
+                location_source="page_text",
+                employment_type="Full-time",
+                description="Build production post-training systems for large language models.",
+                requirements=["Experience with ML systems in production"],
+            )
+        return None
+
+    monkeypatch.setattr(GeminiGroundedSearchClient, "search_jobs", fake_search_jobs)
+    monkeypatch.setattr("apps.api.app.services.job_discovery.service._fetch_job_page", fake_fetch_job_page)
+    monkeypatch.setattr(
+        "apps.api.app.services.job_discovery.service._discover_recovery_links",
+        lambda url, *, recovery_link_cache: [
+            (
+                recovered_url,
+                "Research Engineer, Production Model Post-Training - London",
+            )
+        ]
+        if url == candidate_url
+        else [],
+    )
+
+    result = discover_jobs_from_web(
+        profile=CandidateProfilePayload(
+            headline="Research Engineer",
+            summary="Research engineer shipping AI systems.",
+            location="London, UK",
+            skills=["Python", "machine learning"],
+            achievements=[],
+            experiences=[],
+            education=[],
+            links={},
+        ),
+        search_preferences=SearchPreferencesPayload(
+            target_titles=["Research Engineer"],
+            target_responsibilities=["Ship production AI systems"],
+            locations=["London, UK"],
+            workplace_modes=["hybrid"],
+            include_keywords=["machine learning"],
+            exclude_keywords=[],
+            companies_include=["Anthropic"],
+            companies_exclude=[],
+            result_limit=5,
+        ),
+    )
+
+    assert len(result.jobs) == 1
+    assert result.jobs[0]["url"] == recovered_url
+    assert result.jobs[0]["metadata_json"]["discovery"]["grounded_url"] == candidate_url
+
+
+def test_discover_jobs_from_web_recovers_from_grounding_redirect_wrappers(monkeypatch):
+    candidate_url = "https://jobs.ashbyhq.com/sanity/a2180838-8c1d-4054-9541-610fb8d43890"
+    wrapper_url = "https://vertexaisearch.cloud.google.com/grounding-api-redirect/abc123"
+    recovered_url = "https://jobs.ashbyhq.com/sanity/ec701d24-cda8-47f4-a58c-a89747f4da23"
+
+    def fake_search_jobs(self, *, profile, search_preferences):
+        assert profile.headline == "Support Engineering Manager"
+        assert search_preferences.target_titles == ["Support Engineering Manager"]
+        return GroundedSearchResult(
+            candidates=[
+                GroundedJobCandidate(
+                    company="Sanity",
+                    title="Senior Manager, Support Engineering - Europe",
+                    url=candidate_url,
+                    location="Remote, Europe",
+                    employment_type="Full-time",
+                    source_hint="ashbyhq",
+                    description_snippet="Lead support engineering in Europe.",
+                    why_match="Support leadership overlap.",
+                )
+            ],
+            search_queries=["sanity support engineering manager europe ashby"],
+            source_urls=[wrapper_url],
+        )
+
+    def fake_fetch_job_page(url: str):
+        if url == recovered_url:
+            return FetchedJobPage(
+                final_url=recovered_url,
+                canonical_url=recovered_url,
+                page_title="Senior Manager, Support Engineering - Europe",
+                heading="Senior Manager, Support Engineering - Europe",
+                company="Sanity",
+                location="Remote, Europe",
+                location_source="page_text",
+                employment_type="Full-time",
+                description="Lead the support engineering organization across Europe.",
+                requirements=["Experience leading support engineering teams"],
+            )
+        return None
+
+    monkeypatch.setattr(GeminiGroundedSearchClient, "search_jobs", fake_search_jobs)
+    monkeypatch.setattr("apps.api.app.services.job_discovery.service._fetch_job_page", fake_fetch_job_page)
+    monkeypatch.setattr(
+        "apps.api.app.services.job_discovery.service._discover_recovery_links",
+        lambda url, *, recovery_link_cache: [
+            (recovered_url, "Senior Manager, Support Engineering - Europe")
+        ]
+        if url == wrapper_url
+        else [],
+    )
+
+    result = discover_jobs_from_web(
+        profile=CandidateProfilePayload(
+            headline="Support Engineering Manager",
+            summary="Support engineering leader for SaaS and AI platforms.",
+            location="London, UK",
+            skills=["support leadership", "incident management"],
+            achievements=[],
+            experiences=[],
+            education=[],
+            links={},
+        ),
+        search_preferences=SearchPreferencesPayload(
+            target_titles=["Support Engineering Manager"],
+            target_responsibilities=["Lead support engineering teams"],
+            locations=["Remote, Europe"],
+            workplace_modes=["remote"],
+            include_keywords=["support leadership"],
+            exclude_keywords=[],
+            companies_include=["Sanity"],
+            companies_exclude=[],
+            result_limit=5,
+        ),
+    )
+
+    assert len(result.jobs) == 1
+    assert result.jobs[0]["url"] == recovered_url
+    assert result.jobs[0]["metadata_json"]["discovery"]["grounded_url"] == wrapper_url
+    assert result.jobs[0]["metadata_json"]["discovery"]["candidate_url"] == candidate_url
 
 
 def test_discover_jobs_from_web_rejects_greenhouse_board_pages(monkeypatch):
@@ -538,6 +742,10 @@ def test_discover_jobs_from_web_rejects_greenhouse_board_pages(monkeypatch):
 
     monkeypatch.setattr(GeminiGroundedSearchClient, "search_jobs", fake_search_jobs)
     monkeypatch.setattr("apps.api.app.services.job_discovery.service._fetch_job_page", fake_fetch_job_page)
+    monkeypatch.setattr(
+        "apps.api.app.services.job_discovery.service._discover_recovery_links",
+        lambda _url, *, recovery_link_cache: [],
+    )
 
     with pytest.raises(
         WebDiscoveryError,
@@ -605,6 +813,10 @@ def test_discover_jobs_from_web_rejects_generic_apply_pages(monkeypatch):
 
     monkeypatch.setattr(GeminiGroundedSearchClient, "search_jobs", fake_search_jobs)
     monkeypatch.setattr("apps.api.app.services.job_discovery.service._fetch_job_page", fake_fetch_job_page)
+    monkeypatch.setattr(
+        "apps.api.app.services.job_discovery.service._discover_recovery_links",
+        lambda _url, *, recovery_link_cache: [],
+    )
 
     with pytest.raises(
         WebDiscoveryError,

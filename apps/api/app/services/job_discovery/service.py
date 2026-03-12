@@ -4,7 +4,7 @@ from dataclasses import dataclass
 import json
 import re
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup
@@ -16,6 +16,16 @@ SUPPORTED_APPLY_PLATFORMS = {"greenhouse", "lever", "ashbyhq"}
 SEARCH_SOURCE_HINTS = SUPPORTED_APPLY_PLATFORMS
 ATS_INDEX_PAGE_TITLES = {"jobs", "careers", "open roles", "current openings"}
 ATS_INDEX_PAGE_PREFIXES = ("current openings at ", "open roles at ")
+GENERIC_APPLY_LINK_TEXT = {
+    "apply",
+    "apply now",
+    "apply here",
+    "apply for this position",
+    "learn more",
+    "view job",
+    "view role",
+}
+GROUNDING_REDIRECT_HOSTS = {"vertexaisearch.cloud.google.com"}
 IGNORED_SEARCH_HOSTS = {
     "google.com",
     "www.google.com",
@@ -169,6 +179,7 @@ def _discover_jobs_from_web_attempt(
     fetched_urls: list[str] = []
     rejected_pages_count = 0
     normalized_source_urls: list[tuple[str, str]] = []
+    recovery_link_cache: dict[str, list[tuple[str, str | None]]] = {}
     for url in search_result.source_urls:
         normalized_url = _normalize_url(url)
         if normalized_url:
@@ -180,6 +191,7 @@ def _discover_jobs_from_web_attempt(
             candidate,
             source_urls=source_urls,
             seen_final_urls=seen_final_urls,
+            recovery_link_cache=recovery_link_cache,
         )
         fetched_urls.extend(candidate_fetched_urls)
         rejected_pages_count += candidate_rejections
@@ -567,12 +579,31 @@ def _resolve_grounded_candidate(
     *,
     source_urls: list[tuple[str, str]],
     seen_final_urls: set[str],
+    recovery_link_cache: dict[str, list[tuple[str, str | None]]],
 ) -> tuple[dict[str, Any] | None, list[str], int]:
     fetched_urls: list[str] = []
     rejected_pages_count = 0
-    for grounded_url, fetch_url in _candidate_attempt_urls(candidate, source_urls):
+    attempted_urls: set[str] = set()
+    pending_attempts = list(_candidate_attempt_urls(candidate, source_urls))
+    while pending_attempts:
+        grounded_url, fetch_url = pending_attempts.pop(0)
+        attempt_key = fetch_url.casefold()
+        if attempt_key in attempted_urls:
+            continue
+        attempted_urls.add(attempt_key)
         page = _fetch_job_page(fetch_url)
         if page is None:
+            recovery_attempts = _recovery_attempt_urls(
+                candidate,
+                grounded_url=grounded_url,
+                recovery_links=_discover_recovery_links(
+                    fetch_url,
+                    recovery_link_cache=recovery_link_cache,
+                ),
+                attempted_urls=attempted_urls,
+            )
+            if recovery_attempts:
+                pending_attempts = [*recovery_attempts, *pending_attempts]
             continue
         fetched_urls.append(page.final_url)
         canonical_seen_url = page.canonical_url or page.final_url
@@ -580,13 +611,23 @@ def _resolve_grounded_candidate(
             continue
         if not _page_matches_candidate(candidate, page):
             rejected_pages_count += 1
-            continue
-        payload = _normalize_grounded_job(candidate, page=page, grounded_url=grounded_url)
-        if payload is None:
+        else:
+            payload = _normalize_grounded_job(candidate, page=page, grounded_url=grounded_url)
+            if payload is not None:
+                seen_final_urls.add(canonical_seen_url)
+                return payload, fetched_urls, rejected_pages_count
             rejected_pages_count += 1
-            continue
-        seen_final_urls.add(canonical_seen_url)
-        return payload, fetched_urls, rejected_pages_count
+        recovery_attempts = _recovery_attempt_urls(
+            candidate,
+            grounded_url=grounded_url,
+            recovery_links=_discover_recovery_links(
+                fetch_url,
+                recovery_link_cache=recovery_link_cache,
+            ),
+            attempted_urls=attempted_urls,
+        )
+        if recovery_attempts:
+            pending_attempts = [*recovery_attempts, *pending_attempts]
     return None, fetched_urls, rejected_pages_count
 
 
@@ -609,16 +650,175 @@ def _candidate_attempt_urls(
         if normalized_url == primary_url:
             continue
         source = _detect_apply_platform(normalized_url)
+        if source in SUPPORTED_APPLY_PLATFORMS:
+            if candidate_source in SUPPORTED_APPLY_PLATFORMS and source != candidate_source:
+                continue
+            if not _is_supported_job_detail_url(normalized_url, source):
+                continue
+            if company_key and company_key not in _match_key(normalized_url):
+                continue
+            fallback_urls.append((raw_url, normalized_url))
+            continue
+        if _should_probe_source_url(normalized_url):
+            fallback_urls.append((raw_url, normalized_url))
+    return _dedupe_candidate_attempts([*attempts, *fallback_urls])
+
+
+def _discover_recovery_links(
+    url: str,
+    *,
+    recovery_link_cache: dict[str, list[tuple[str, str | None]]],
+) -> list[tuple[str, str | None]]:
+    normalized_url = _normalize_url(url)
+    if not normalized_url:
+        return []
+    cached = recovery_link_cache.get(normalized_url)
+    if cached is not None:
+        return cached
+    try:
+        with httpx.Client(
+            timeout=httpx.Timeout(20.0, connect=10.0),
+            follow_redirects=True,
+            headers={"User-Agent": "PT Job Hunting Agent/1.0"},
+        ) as client:
+            response = client.get(url)
+            response.raise_for_status()
+    except httpx.HTTPError:
+        recovery_link_cache[normalized_url] = []
+        return []
+
+    final_url = _normalize_url(str(response.url)) or normalized_url
+    soup = BeautifulSoup(response.text, "html.parser")
+    page_title = _clean_text(soup.title.string if soup.title and soup.title.string else "")
+    heading = _first_text(soup, ["h1", "main h1", "article h1"])
+    discovered_links = _extract_supported_apply_links(
+        soup,
+        base_url=final_url,
+        page_title=page_title,
+        heading=heading,
+    )
+    recovery_link_cache[normalized_url] = discovered_links
+    recovery_link_cache.setdefault(final_url, discovered_links)
+    return discovered_links
+
+
+def _extract_supported_apply_links(
+    soup: BeautifulSoup,
+    *,
+    base_url: str,
+    page_title: str | None,
+    heading: str | None,
+) -> list[tuple[str, str | None]]:
+    context_label = heading or page_title
+    discovered_links: list[tuple[str, str | None]] = []
+    normalized_base_url = _normalize_recovered_job_url(base_url)
+    base_source = _detect_apply_platform(normalized_base_url) if normalized_base_url else "generic"
+    if (
+        normalized_base_url
+        and base_source in SUPPORTED_APPLY_PLATFORMS
+        and _is_supported_job_detail_url(normalized_base_url, base_source)
+    ):
+        discovered_links.append((normalized_base_url, context_label))
+
+    for node in soup.select("a[href]"):
+        href = node.get("href")
+        candidate_url = _normalize_recovered_job_url(urljoin(base_url, str(href or "")))
+        if not candidate_url or _is_ignored_search_host(candidate_url):
+            continue
+        source = _detect_apply_platform(candidate_url)
         if source not in SUPPORTED_APPLY_PLATFORMS:
             continue
-        if candidate_source in SUPPORTED_APPLY_PLATFORMS and source != candidate_source:
+        if not _is_supported_job_detail_url(candidate_url, source):
             continue
-        if not _is_supported_job_detail_url(normalized_url, source):
+        label = _clean_text(node.get_text(" ", strip=True)) or _clean_text(node.get("aria-label"))
+        if _is_generic_apply_link_text(label):
+            label = context_label or label
+        discovered_links.append((candidate_url, label or context_label))
+    return _dedupe_recovery_links(discovered_links)
+
+
+def _normalize_recovered_job_url(url: str) -> str | None:
+    normalized_url = _normalize_url(url)
+    if not normalized_url:
+        return None
+    source = _detect_apply_platform(normalized_url)
+    if source not in SUPPORTED_APPLY_PLATFORMS:
+        return normalized_url
+    parsed = urlsplit(normalized_url)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if source in {"ashbyhq", "greenhouse"} and segments and segments[-1].casefold() == "application":
+        segments = segments[:-1]
+    if source == "lever" and segments and segments[-1].casefold() == "apply":
+        segments = segments[:-1]
+    normalized_path = "/" + "/".join(segments) if segments else ""
+    return urlunsplit((parsed.scheme, parsed.netloc, normalized_path, "", ""))
+
+
+def _recovery_attempt_urls(
+    candidate: GroundedJobCandidate,
+    *,
+    grounded_url: str,
+    recovery_links: list[tuple[str, str | None]],
+    attempted_urls: set[str],
+) -> list[tuple[str, str]]:
+    scored_links: list[tuple[int, str]] = []
+    for recovery_url, label in recovery_links:
+        if recovery_url.casefold() in attempted_urls:
             continue
-        if company_key and company_key not in _match_key(normalized_url):
+        score = _recovery_link_score(candidate, recovery_url, label)
+        if score <= 0:
             continue
-        fallback_urls.append((raw_url, normalized_url))
-    return _dedupe_candidate_attempts([*attempts, *fallback_urls])
+        scored_links.append((score, recovery_url))
+    scored_links.sort(key=lambda item: item[0], reverse=True)
+    return [(grounded_url, recovery_url) for _score, recovery_url in scored_links[:8]]
+
+
+def _recovery_link_score(
+    candidate: GroundedJobCandidate,
+    url: str,
+    label: str | None,
+) -> int:
+    haystack = " ".join(part for part in [label or "", url] if part)
+    haystack_key = _match_key(haystack)
+    haystack_tokens = _match_tokens(haystack)
+    if not haystack_key or not haystack_tokens:
+        return 0
+
+    score = 0
+    candidate_key = _match_key(candidate.title)
+    candidate_title_tokens = _match_tokens(candidate.title)
+    if candidate_key:
+        if candidate_key in haystack_key or haystack_key in candidate_key:
+            score += 100
+        else:
+            shared_title_tokens = len(candidate_title_tokens & haystack_tokens)
+            if candidate_title_tokens and shared_title_tokens == 0:
+                return 0
+            if shared_title_tokens == 1 and len(candidate_title_tokens) > 1:
+                return 0
+            score += shared_title_tokens * 10
+
+    candidate_company_tokens = _match_tokens(candidate.company)
+    score += len(candidate_company_tokens & haystack_tokens) * 4
+    if candidate.source_hint in SUPPORTED_APPLY_PLATFORMS and _detect_apply_platform(url) == candidate.source_hint:
+        score += 3
+    return score
+
+
+def _should_probe_source_url(url: str) -> bool:
+    if _is_ignored_search_host(url):
+        return False
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower().replace("www.", "")
+    if host in GROUNDING_REDIRECT_HOSTS:
+        return True
+    normalized_path = parsed.path.casefold()
+    return any(fragment in normalized_path for fragment in ("/career", "/careers", "/job", "/jobs"))
+
+
+def _is_generic_apply_link_text(value: str | None) -> bool:
+    normalized = " ".join(str(value or "").strip().casefold().split())
+    return not normalized or normalized in GENERIC_APPLY_LINK_TEXT
 
 
 def _page_matches_candidate(
@@ -947,4 +1147,16 @@ def _dedupe_candidate_attempts(values: list[tuple[str, str]]) -> list[tuple[str,
             continue
         seen.add(key)
         result.append((raw_url, normalized_url))
+    return result
+
+
+def _dedupe_recovery_links(values: list[tuple[str, str | None]]) -> list[tuple[str, str | None]]:
+    seen: set[str] = set()
+    result: list[tuple[str, str | None]] = []
+    for url, label in values:
+        key = url.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append((url, label))
     return result
