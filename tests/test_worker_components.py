@@ -17,7 +17,7 @@ from apps.api.app.services.llm.base import DisabledLLMClient, DraftedAnswerSugge
 from apps.worker.answer_resolver import build_preview_summary, resolve_fields
 from apps.worker.field_classifier import classify_field
 from apps.worker.form_extractor import extract_form_fields
-from apps.worker.main import _resolve_selector
+from apps.worker.main import _resolve_selector, _should_capture_screenshot
 from apps.worker.platform_adapters import detect_platform
 
 
@@ -59,6 +59,15 @@ def test_detect_platform_recognizes_ashbyhq_urls():
         detect_platform("https://jobs.ashbyhq.com/Ashby/1234-support-engineer/application", "generic")
         == "ashbyhq"
     )
+
+
+def test_should_capture_screenshot_only_for_failures_and_submission_states():
+    assert _should_capture_screenshot("failed") is True
+    assert _should_capture_screenshot("submit_clicked") is True
+    assert _should_capture_screenshot("submitted") is True
+    assert _should_capture_screenshot("preview_ready") is False
+    assert _should_capture_screenshot("awaiting_answers") is False
+    assert _should_capture_screenshot("ready_for_submit") is False
 
 
 def test_extract_form_fields_prefers_structural_selector_attributes():

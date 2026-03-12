@@ -85,6 +85,25 @@ def enqueue_worker_task(
     draft: ApplicationDraft,
     payload: ApplicationRunRequest,
 ) -> tuple[BackgroundTask, WorkerRun]:
+    existing_task = session.execute(
+        select(BackgroundTask)
+        .where(
+            BackgroundTask.application_draft_id == draft.id,
+            BackgroundTask.task_type == "worker_run",
+            BackgroundTask.status.in_(("queued", "running")),
+        )
+        .order_by(BackgroundTask.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing_task is not None:
+        existing_worker_run = _require_related(
+            session,
+            WorkerRun,
+            existing_task.worker_run_id,
+            "worker run",
+        )
+        return existing_task, existing_worker_run
+
     worker_request, _job = build_worker_request(session, draft=draft, payload=payload)
     worker_run = create_worker_run_placeholder(
         session,

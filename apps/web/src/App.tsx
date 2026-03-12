@@ -1133,6 +1133,15 @@ function App() {
       return
     }
 
+    const latestRun = latestRunByApplicationId.get(applicationId)
+    if (latestRun && isPendingWorkerStatus(latestRun.status)) {
+      updateStatus('A worker run is already in progress for this application.', {
+        tone: 'warning',
+        toast: true,
+      })
+      return
+    }
+
     const busyLabel = options.confirmSubmit ? `submit-${applicationId}` : `preview-${applicationId}`
     await runAction(busyLabel, async () => {
       await queueWorkerRun(applicationId, {
@@ -1314,6 +1323,7 @@ function App() {
     (field) => field.answer_value && !field.requires_review,
   )
   const isLastWorkerRunCollapsed = lastWorkerRun ? (collapsedWorkerRunIds[lastWorkerRun.id] ?? false) : false
+  const isLastWorkerRunPending = isPendingWorkerStatus(lastWorkerRun?.status)
 
   return (
     <main className="app-shell">
@@ -2135,7 +2145,7 @@ function App() {
                         </div>
                         <div className="signal-block">
                           <span className="signal-label">CRM</span>
-                          <div className="profile-grid">
+                          <div className="crm-grid">
                             <label className="field field-compact">
                               <span>Stage</span>
                               <select
@@ -2360,6 +2370,7 @@ function App() {
                       draftEditors[application.id] ?? createDraftEditorState(application)
                     const linkedJob = jobsById.get(application.job_lead_id)
                     const latestRun = latestRunByApplicationId.get(application.id)
+                    const isLatestRunPending = latestRun ? isPendingWorkerStatus(latestRun.status) : false
                     const previewKey = `preview-${application.id}`
                     const submitKey = `submit-${application.id}`
                   const isDraftCollapsed = collapsedDraftIds[application.id] ?? false
@@ -2474,12 +2485,20 @@ function App() {
                           </div>
                           {latestRun ? (
                             <div className="draft-run-summary">
-                              <span className="count-badge">
-                                {latestRun.preview_summary.autofill_ready_count} autofill-ready
-                              </span>
-                              <span className="count-badge">
-                                {latestRun.preview_summary.review_required_count} review items
-                              </span>
+                              {isLatestRunPending ? (
+                                <span className="count-badge count-badge-info">
+                                  Background run in progress
+                                </span>
+                              ) : (
+                                <>
+                                  <span className="count-badge">
+                                    {latestRun.preview_summary.autofill_ready_count} autofill-ready
+                                  </span>
+                                  <span className="count-badge">
+                                    {latestRun.preview_summary.review_required_count} review items
+                                  </span>
+                                </>
+                              )}
                             </div>
                           ) : null}
                           {latestRun || linkedJob ? (
@@ -2513,9 +2532,13 @@ function App() {
                                   confirmSubmit: false,
                                 })
                               }
-                              disabled={busyKey === previewKey}
+                              disabled={busyKey === previewKey || isLatestRunPending}
                             >
-                              {busyKey === previewKey ? 'Generating preview...' : 'Preview Autofill'}
+                              {busyKey === previewKey
+                                ? 'Generating preview...'
+                                : isLatestRunPending
+                                  ? 'Preview Running...'
+                                  : 'Preview Autofill'}
                             </button>
                             <button
                               onClick={() =>
@@ -2524,9 +2547,13 @@ function App() {
                                   confirmSubmit: true,
                                 })
                               }
-                              disabled={busyKey === submitKey}
+                              disabled={busyKey === submitKey || isLatestRunPending}
                             >
-                              {busyKey === submitKey ? 'Submitting...' : 'Submit Application'}
+                              {busyKey === submitKey
+                                ? 'Submitting...'
+                                : isLatestRunPending
+                                  ? 'Run In Progress...'
+                                  : 'Submit Application'}
                             </button>
                             <button
                               type="button"
@@ -2621,22 +2648,38 @@ function App() {
                         Status: <strong>{formatWorkerStatus(lastWorkerRun.status)}</strong>
                       </p>
                       <p>
-                        Previewed fields: <strong>{lastWorkerRun.preview_summary.total_fields}</strong>
+                        Previewed fields:{' '}
+                        <strong>
+                          {isLastWorkerRunPending ? 'Processing...' : lastWorkerRun.preview_summary.total_fields}
+                        </strong>
                       </p>
                       <p>
-                        Needs review: <strong>{lastWorkerRun.preview_summary.review_required_count}</strong>
+                        Needs review:{' '}
+                        <strong>
+                          {isLastWorkerRunPending
+                            ? 'Processing...'
+                            : lastWorkerRun.preview_summary.review_required_count}
+                        </strong>
                       </p>
                     </div>
                     <div className="worker-badge-row">
-                      <span className="count-badge">
-                        {lastWorkerRun.preview_summary.autofill_ready_count} autofill-ready
-                      </span>
-                      <span className="count-badge">
-                        {lastWorkerRun.preview_summary.unresolved_required_count} unresolved required
-                      </span>
-                      <span className="count-badge">
-                        {lastWorkerRun.preview_summary.llm_suggestions_count} LLM suggestions
-                      </span>
+                      {isLastWorkerRunPending ? (
+                        <span className="count-badge count-badge-info">
+                          Extraction and screenshot are still processing
+                        </span>
+                      ) : (
+                        <>
+                          <span className="count-badge">
+                            {lastWorkerRun.preview_summary.autofill_ready_count} autofill-ready
+                          </span>
+                          <span className="count-badge">
+                            {lastWorkerRun.preview_summary.unresolved_required_count} unresolved required
+                          </span>
+                          <span className="count-badge">
+                            {lastWorkerRun.preview_summary.llm_suggestions_count} LLM suggestions
+                          </span>
+                        </>
+                      )}
                     </div>
                     {lastWorkerRun.screenshot_path ? (
                       <div className="worker-artifact-card">
@@ -2658,6 +2701,10 @@ function App() {
                           Open screenshot
                         </a>
                       </div>
+                    ) : isLastWorkerRunPending ? (
+                      <p className="muted worker-path">
+                        Screenshot and extracted fields will appear when the background run finishes.
+                      </p>
                     ) : (
                       <p className="muted worker-path">Screenshot unavailable.</p>
                     )}
@@ -2692,7 +2739,7 @@ function App() {
                       </div>
                     ) : null}
 
-                    {lastWorkerRun.review_items.length > 0 ? (
+                    {!isLastWorkerRunPending && lastWorkerRun.review_items.length > 0 ? (
                       <div className="worker-review-section">
                         <h3>Review required</h3>
                         <div className="review-grid">
@@ -2754,7 +2801,7 @@ function App() {
                       </div>
                     ) : null}
 
-                    {autofillReadyFields.length > 0 ? (
+                    {!isLastWorkerRunPending && autofillReadyFields.length > 0 ? (
                       <div className="worker-ready-section">
                         <h3>Autofill ready</h3>
                         <div className="tag-row">
@@ -2767,7 +2814,7 @@ function App() {
                       </div>
                     ) : null}
 
-                    {lastWorkerRun.actions.length > 0 ? (
+                    {!isLastWorkerRunPending && lastWorkerRun.actions.length > 0 ? (
                       <div>
                         <h3>Planned actions</h3>
                         <ul>
@@ -2799,11 +2846,15 @@ function App() {
                               confirmSubmit: false,
                             })
                           }
-                          disabled={busyKey === `preview-${currentRunApplicationId}`}
+                          disabled={
+                            busyKey === `preview-${currentRunApplicationId}` || isLastWorkerRunPending
+                          }
                         >
                           {busyKey === `preview-${currentRunApplicationId}`
                             ? 'Refreshing preview...'
-                            : 'Refresh Preview'}
+                            : isLastWorkerRunPending
+                              ? 'Preview Running...'
+                              : 'Refresh Preview'}
                         </button>
                         <button
                           onClick={() =>
@@ -2812,11 +2863,15 @@ function App() {
                               confirmSubmit: true,
                             })
                           }
-                          disabled={busyKey === `submit-${currentRunApplicationId}`}
+                          disabled={
+                            busyKey === `submit-${currentRunApplicationId}` || isLastWorkerRunPending
+                          }
                         >
                           {busyKey === `submit-${currentRunApplicationId}`
                             ? 'Submitting...'
-                            : 'Submit With Approved Answers'}
+                            : isLastWorkerRunPending
+                              ? 'Run In Progress...'
+                              : 'Submit With Approved Answers'}
                         </button>
                         <button
                           type="button"
@@ -3015,6 +3070,10 @@ function getTrackedJobStatus(
 
 function isRecordedApplicationStatus(status?: string | null) {
   return status === 'submitted' || status === 'submit_clicked'
+}
+
+function isPendingWorkerStatus(status?: string | null) {
+  return status === 'queued' || status === 'running'
 }
 
 function getShortlistJobPriority(status?: string | null) {

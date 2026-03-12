@@ -58,6 +58,36 @@ def test_worker_preview_extracts_semantic_greenhouse_fields(client, monkeypatch)
     why_anthropic = next(field for field in worker_run["review_items"] if field["field_id"] == "question-why-anthropic")
     assert why_anthropic["answer_source"] == "gemini"
     assert why_anthropic["requires_review"] is True
+    assert worker_run["screenshot_path"] is None
+
+
+def test_worker_preview_does_not_capture_screenshot(client, monkeypatch):
+    monkeypatch.setattr("apps.worker.main.get_llm_client", lambda: FakeLLMClient())
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("_save_screenshot should not be called for preview or review runs")
+
+    monkeypatch.setattr("apps.worker.main._save_screenshot", fail_if_called)
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/fixture-preview-no-shot",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    fixture_html = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={"dry_run": True, "fixture_html": fixture_html},
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "awaiting_answers"
+    assert worker_run["screenshot_path"] is None
 
 
 def test_worker_submit_with_review_overrides_submits_greenhouse_form(client):
@@ -99,6 +129,40 @@ def test_worker_submit_with_review_overrides_submits_greenhouse_form(client):
     with SessionLocal() as session:
         job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one()
         assert job.status == "submitted"
+
+
+def test_worker_submission_captures_screenshot(client, monkeypatch):
+    monkeypatch.setattr("apps.worker.main._save_screenshot", lambda _page, _platform: "/tmp/submitted-shot.png")
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/fixture-submit-shot",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": confirmed_greenhouse_submit_fixture_html(),
+            "answer_overrides": [
+                {"field_id": "question-work-auth", "value": "Yes"},
+                {
+                    "field_id": "question-why-anthropic",
+                    "value": "Anthropic sits at the intersection of AI quality, support, and real customer impact.",
+                },
+            ],
+        },
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "submitted"
+    assert worker_run["screenshot_path"] == "/tmp/submitted-shot.png"
 
 
 def test_worker_submit_without_confirmation_marks_submit_clicked(client):
