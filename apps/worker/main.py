@@ -42,6 +42,7 @@ VALIDATION_ERROR_TEXT_PATTERNS = [
     re.compile(r"\bmust be selected\b", re.IGNORECASE),
     re.compile(r"\bcan't be blank\b", re.IGNORECASE),
 ]
+SCREENSHOT_CAPTURE_STATUSES = {"failed", "submit_clicked", "submitted"}
 
 
 def run_worker(request: WorkerRunRequest) -> dict[str, Any]:
@@ -127,10 +128,11 @@ def run_worker(request: WorkerRunRequest) -> dict[str, Any]:
             status = "failed"
             logs.append(f"Browser automation failed: {exc}")
         finally:
-            try:
-                screenshot_path = _save_screenshot(page, platform)
-            except PlaywrightError as exc:
-                logs.append(f"Could not capture final screenshot: {exc}")
+            if _should_capture_screenshot(status):
+                try:
+                    screenshot_path = _save_screenshot(page, platform)
+                except PlaywrightError as exc:
+                    logs.append(f"Could not capture final screenshot: {exc}")
             browser.close()
 
     return {
@@ -381,6 +383,10 @@ def _save_screenshot(page, platform: str) -> str:
     path = screenshot_dir / f"{platform}-worker-{timestamp}-{uuid4().hex[:8]}.png"
     page.screenshot(path=str(path), full_page=True)
     return str(path)
+
+
+def _should_capture_screenshot(status: str) -> bool:
+    return status in SCREENSHOT_CAPTURE_STATUSES
 
 
 def _confirm_submission(page, initial_url: str) -> tuple[bool, str]:

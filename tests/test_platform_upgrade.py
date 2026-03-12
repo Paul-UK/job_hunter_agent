@@ -176,6 +176,38 @@ def test_queue_worker_run_processes_placeholder_result(client, monkeypatch):
         assert worker_run.status == "preview_ready"
 
 
+def test_queue_worker_run_reuses_existing_active_task(client):
+    seed_profile(client)
+    job_id = create_job(client)
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft_id = draft_response.json()["id"]
+
+    first_response = client.post(
+        f"/api/applications/{draft_id}/queue-run",
+        json={"dry_run": True, "confirm_submit": False},
+    )
+    assert first_response.status_code == 200
+
+    second_response = client.post(
+        f"/api/applications/{draft_id}/queue-run",
+        json={"dry_run": True, "confirm_submit": False},
+    )
+    assert second_response.status_code == 200
+    assert second_response.json()["id"] == first_response.json()["id"]
+    assert second_response.json()["worker_run_id"] == first_response.json()["worker_run_id"]
+
+    with SessionLocal() as session:
+        task_count = session.execute(
+            select(BackgroundTask).where(BackgroundTask.application_draft_id == draft_id)
+        ).scalars().all()
+        worker_run_count = session.execute(
+            select(WorkerRun).where(WorkerRun.application_draft_id == draft_id)
+        ).scalars().all()
+        assert len(task_count) == 1
+        assert len(worker_run_count) == 1
+
+
 def test_job_crm_patch_updates_role_state(client):
     seed_profile(client)
     job_id = create_job(client)
