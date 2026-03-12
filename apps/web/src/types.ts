@@ -86,6 +86,25 @@ export interface JobLeadResponse {
     github_summary?: string
     top_languages?: string[]
   }
+  crm_stage:
+    | 'new'
+    | 'shortlisted'
+    | 'drafted'
+    | 'applied'
+    | 'interviewing'
+    | 'offer'
+    | 'rejected'
+    | 'archived'
+  crm_notes?: string | null
+  follow_up_at?: string | null
+  last_contacted_at?: string | null
+  first_seen_at?: string | null
+  last_seen_at?: string | null
+  last_checked_at?: string | null
+  closed_at?: string | null
+  is_active: boolean
+  created_at?: string | null
+  updated_at?: string | null
 }
 
 export interface WebJobDiscoveryResponse {
@@ -94,6 +113,91 @@ export interface WebJobDiscoveryResponse {
   search_queries: string[]
   source_urls: string[]
   grounded_pages_count: number
+}
+
+export interface SavedSearchResponse {
+  id: number
+  profile_id: number
+  name: string
+  search_preferences: SearchPreferencesPayload
+  enabled: boolean
+  is_default: boolean
+  cadence_minutes: number
+  last_run_at?: string | null
+  last_success_at?: string | null
+  next_run_at?: string | null
+  last_status: string
+  last_error?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface DiscoveryRunResponse {
+  id: number
+  saved_search_id: number
+  profile_id: number
+  trigger_kind: string
+  status: string
+  model_name?: string | null
+  search_preferences_snapshot: SearchPreferencesPayload
+  search_queries: string[]
+  source_urls: string[]
+  grounded_pages_count: number
+  jobs_created_count: number
+  diagnostics: Record<string, unknown>
+  error_message?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface SavedSearchMatchResponse {
+  id: number
+  saved_search_id: number
+  job_lead_id: number
+  discovery_run_id?: number | null
+  current_score?: number | null
+  score_details: {
+    summary?: string
+    matched_signals?: string[]
+    matched_skills?: string[]
+    missing_signals?: string[]
+    base_score?: number
+    feedback_state?: string
+    feedback_adjustment?: number
+    saved_search_name?: string
+  }
+  feedback_state: string
+  feedback_note?: string | null
+  last_feedback_at?: string | null
+  first_seen_at?: string | null
+  last_seen_at?: string | null
+  created_at?: string | null
+  updated_at?: string | null
+}
+
+export interface BackgroundTaskResponse {
+  id: number
+  task_type: string
+  title: string
+  status: string
+  profile_id?: number | null
+  saved_search_id?: number | null
+  discovery_run_id?: number | null
+  application_draft_id?: number | null
+  worker_run_id?: number | null
+  payload_json: Record<string, unknown>
+  result_json: Record<string, unknown>
+  error_message?: string | null
+  scheduled_at?: string | null
+  started_at?: string | null
+  completed_at?: string | null
+  heartbeat_at?: string | null
+  attempt_count: number
+  max_attempts: number
+  created_at?: string | null
+  updated_at?: string | null
 }
 
 export interface ScreeningAnswerPayload {
@@ -204,6 +308,7 @@ export interface WorkerRunResponse {
   job_snapshot: Record<string, unknown>
   draft_snapshot: Record<string, unknown>
   created_at?: string | null
+  updated_at?: string | null
 }
 
 export interface DashboardResponse {
@@ -212,4 +317,8 @@ export interface DashboardResponse {
   jobs: JobLeadResponse[]
   applications: ApplicationDraftResponse[]
   worker_runs: WorkerRunResponse[]
+  saved_searches: SavedSearchResponse[]
+  discovery_runs: DiscoveryRunResponse[]
+  saved_search_matches: SavedSearchMatchResponse[]
+  background_tasks: BackgroundTaskResponse[]
 }

@@ -690,6 +690,12 @@ button:disabled {
   color: rgba(255, 202, 202, 0.94);
 }
 
+.count-badge-info {
+  border-color: rgba(122, 164, 255, 0.34);
+  background: linear-gradient(180deg, rgba(28, 46, 84, 0.72), rgba(15, 25, 46, 0.82));
+  color: rgba(201, 219, 255, 0.94);
+}
+
 .job-card,
 .draft-card {
   padding: 1.25rem;

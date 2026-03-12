@@ -9,14 +9,17 @@ The product is intentionally human-in-the-loop. It helps with profile parsing, l
 - Parse a CV from `PDF`, `DOCX`, or plain text into a structured profile.
 - Merge additional context from pasted LinkedIn text or exported LinkedIn HTML.
 - Seed editable job-search intent from the merged profile so discovery and ranking share the same target titles, responsibilities, locations, and keywords.
+- Persist named saved searches with schedules, per-search match scores, feedback signals, and discovery history.
 - Discover roles manually from Greenhouse, Lever, and Ashby by company identifier, or use experimental Gemini-grounded web discovery for direct ATS job pages.
 - Rank jobs using title alignment, skills, location, intent alignment, and seniority/scope signals.
+- Queue AI discovery and worker execution as database-backed background tasks instead of blocking the request path.
 - Generate tailored application drafts with summaries, cover notes, and screening answers.
 - Improve long-form answers and cover notes with an optional Gemini layer.
 - Run a semantic Playwright worker that extracts fields from ATS pages, classifies them, resolves answers, and pauses when review is needed.
 - Persist every worker run with fields, actions, logs, screenshots, and status.
 - Confirm ATS submission separately from just clicking submit.
 - Track already-handled roles in the shortlist to reduce duplicate applications.
+- Capture lightweight CRM state on jobs such as stage, notes, follow-up time, freshness timestamps, and active/inactive state.
 - Keep the UI manageable with filters, collapse controls, delete flows, and lightweight toast notifications.
 
 ## Architecture Overview
@@ -59,7 +62,7 @@ flowchart LR
 - FastAPI orchestration layer.
 - Owns persistence, ranking, research, drafting, worker execution, and dashboard aggregation.
 - Uses SQLAlchemy models with a local SQLite database.
-- Applies lightweight runtime schema updates on startup for the local database.
+- Applies versioned local database migrations on startup and manages queued background tasks.
 
 ### `apps/worker`
 
@@ -87,7 +90,8 @@ job_hunter_agent/
 ├── artifacts/      Worker screenshots and generated artifacts
 ├── data/           Local SQLite database and uploads
 ├── scripts/
-│   └── dev.py      Starts API and web dev servers together
+│   ├── dev.py           Starts API, orchestrator, and web dev servers together
+│   └── orchestrator.py  Processes queued background discovery and worker tasks
 ├── tests/          Worker, API, ranking, drafting, deletion, research tests
 ├── pyproject.toml  Python dependencies and test/lint config
 └── README.md
@@ -176,7 +180,7 @@ Individual inputs such as CV upload or LinkedIn import. These can be deleted ind
 
 ### `JobLead`
 
-Discovered opportunity from manual ATS sourcing, AI grounded web discovery, or direct capture flows. Stores source metadata, discovery provenance, ranking output, research context, and can reflect the most recently recorded application state in the workspace.
+Discovered opportunity from manual ATS sourcing, AI grounded web discovery, or direct capture flows. Stores source metadata, discovery provenance, ranking output, research context, freshness timestamps, and lightweight CRM state.
 
 ### `ApplicationDraft`
 
@@ -185,6 +189,22 @@ Editable application package for a specific job lead. Stores tailored summary, c
 ### `WorkerRun`
 
 Immutable snapshot of one preview or submission attempt. Stores extracted fields, review items, actions, logs, screenshots, and status.
+
+### `SavedSearch`
+
+Named search intent with schedule settings, latest run state, and default-search linkage back to the active profile.
+
+### `DiscoveryRun`
+
+One persisted background or manual discovery execution with grounded queries, source URLs, diagnostics, and job creation counts.
+
+### `SavedSearchMatch`
+
+Per-search view of a job lead. Stores search-specific fit score, feedback state, and discovery linkage without collapsing everything into one global job score.
+
+### `BackgroundTask`
+
+Database-backed queue entry for saved-search discovery or worker execution. Tracks status, attempts, related records, and result/error payloads.
 
 ## Safety Model
 
@@ -236,7 +256,7 @@ cd apps/web && npm install
 uv run playwright install chromium
 ```
 
-5. Start the API and web app together from the repo root:
+5. Start the API, background orchestrator, and web app together from the repo root:
 
 ```bash
 uv run python scripts/dev.py
@@ -260,6 +280,9 @@ Key values from `.env.example`:
 - `JOB_AGENT_GEMINI_DISCOVERY_MODEL`: Gemini model dedicated to AI web discovery
 - `JOB_AGENT_GEMINI_DISCOVERY_TIMEOUT_SECONDS`: timeout for grounded web discovery calls
 - `JOB_AGENT_GEMINI_DISCOVERY_MAX_ATTEMPTS`: retry count for flaky grounded discovery responses
+- `JOB_AGENT_DEFAULT_SEARCH_CADENCE_MINUTES`: default cadence for newly created saved searches
+- `JOB_AGENT_BACKGROUND_TASK_MAX_ATTEMPTS`: retry limit for queued discovery tasks
+- `JOB_AGENT_ORCHESTRATOR_POLL_SECONDS`: background task polling interval
 - `VITE_API_BASE_URL`: optional explicit frontend API base URL. Leave blank in local dev to use the Vite `/api` proxy.
 
 ## Key API Surfaces
@@ -267,6 +290,7 @@ Key values from `.env.example`:
 ### Meta
 
 - `GET /api/health`
+- `GET /api/health/worker`
 - `GET /api/dashboard`
 
 ### Profile
@@ -288,8 +312,20 @@ Key values from `.env.example`:
 - `POST /api/jobs/discover/linkedin`
 - `POST /api/jobs/{job_id}/research`
 - `POST /api/jobs/{job_id}/draft`
+- `PATCH /api/jobs/{job_id}/crm`
 - `POST /api/jobs/bulk-delete`
 - `DELETE /api/jobs/{job_id}`
+
+### Saved Searches And Queue
+
+- `GET /api/searches`
+- `POST /api/searches`
+- `PUT /api/searches/{search_id}`
+- `DELETE /api/searches/{search_id}`
+- `POST /api/searches/{search_id}/run`
+- `POST /api/searches/{search_id}/matches/{job_id}/feedback`
+- `GET /api/tasks`
+- `POST /api/tasks/process`
 
 ### Applications And Worker Runs
 
@@ -298,6 +334,7 @@ Key values from `.env.example`:
 - `GET /api/applications/runs/{run_id}/screenshot`
 - `POST /api/applications/{application_id}/assist`
 - `POST /api/applications/{application_id}/run`
+- `POST /api/applications/{application_id}/queue-run`
 - `DELETE /api/applications/{application_id}`
 - `DELETE /api/applications/runs/{run_id}`
 

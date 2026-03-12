@@ -1,9 +1,7 @@
 import {
   type CSSProperties,
-  type Dispatch,
   type KeyboardEvent,
   type MouseEvent,
-  type SetStateAction,
   useCallback,
   useEffect,
   useMemo,
@@ -15,18 +13,24 @@ import {
   assistApplicationDraft,
   buildApiUrl,
   bulkDeleteJobLeads,
+  createSavedSearch,
   createDraft,
-  discoverAshby,
-  discoverGreenhouse,
-  discoverLever,
-  discoverWebJobs,
+  deleteSavedSearch,
   deleteApplicationDraft,
   deleteJobLead,
   deleteProfileSource,
+  discoverAshby,
+  discoverGreenhouse,
+  discoverLever,
   deleteWorkerRun,
   getDashboard,
-  runWorker,
+  processBackgroundTasks,
+  queueWorkerRun,
+  runSavedSearch,
+  saveSearchFeedback,
+  updateJobCrm,
   updateProfile,
+  updateSavedSearch,
   uploadCv,
   uploadLinkedinFile,
   uploadLinkedinText,
@@ -34,11 +38,13 @@ import {
 import type {
   ApplicationDraftResponse,
   CandidateProfilePayload,
+  DiscoveryRunResponse,
   DashboardResponse,
   JobLeadResponse,
+  SavedSearchMatchResponse,
+  SavedSearchResponse,
   SearchPreferencesPayload,
   ScreeningAnswerPayload,
-  WebJobDiscoveryResponse,
   WorkerFieldState,
   WorkerRunResponse,
 } from './types'
@@ -46,6 +52,15 @@ import type {
 type WorkplaceFilterValue = 'all' | 'remote' | 'hybrid' | 'on-site'
 type SearchWorkplaceMode = Exclude<WorkplaceFilterValue, 'all'>
 type ManualAtsSource = 'greenhouse' | 'lever' | 'ashbyhq'
+type CrmStage =
+  | 'new'
+  | 'shortlisted'
+  | 'drafted'
+  | 'applied'
+  | 'interviewing'
+  | 'offer'
+  | 'rejected'
+  | 'archived'
 type DraftEditorState = {
   cover_note: string
   screening_answers: ScreeningAnswerPayload[]
@@ -64,10 +79,13 @@ type ToastNotification = {
   message: string
   tone: ToastTone
 }
-type LastWebDiscoveryState = Pick<
-  WebJobDiscoveryResponse,
-  'grounded_pages_count' | 'search_queries' | 'source_urls'
->
+type CrmEditorState = {
+  crm_stage: CrmStage
+  crm_notes: string
+  follow_up_at: string
+  last_contacted_at: string
+  is_active: boolean
+}
 
 const emptyProfile: CandidateProfilePayload = {
   full_name: '',
@@ -133,14 +151,18 @@ function App() {
   const [cvFile, setCvFile] = useState<File | null>(null)
   const [linkedinText, setLinkedinText] = useState('')
   const [linkedinFile, setLinkedinFile] = useState<File | null>(null)
+  const [selectedSavedSearchId, setSelectedSavedSearchId] = useState<number | null>(null)
+  const [savedSearchName, setSavedSearchName] = useState('')
+  const [savedSearchCadenceMinutes, setSavedSearchCadenceMinutes] = useState(1440)
+  const [savedSearchEnabled, setSavedSearchEnabled] = useState(true)
   const [searchPreferences, setSearchPreferences] =
     useState<SearchPreferencesPayload>(emptySearchPreferences)
-  const [lastWebDiscovery, setLastWebDiscovery] = useState<LastWebDiscoveryState | null>(null)
   const [manualDiscoveryInputs, setManualDiscoveryInputs] =
     useState<Record<ManualAtsSource, string[]>>(emptyManualDiscoveryInputs)
   const [profileEditor, setProfileEditor] = useState<CandidateProfilePayload>(emptyProfile)
   const [lastWorkerRun, setLastWorkerRun] = useState<WorkerRunResponse | null>(null)
   const [draftEditors, setDraftEditors] = useState<Record<number, DraftEditorState>>({})
+  const [crmEditors, setCrmEditors] = useState<Record<number, CrmEditorState>>({})
   const [reviewOverrides, setReviewOverrides] = useState<Record<number, Record<string, string>>>({})
   const [collapsedDraftIds, setCollapsedDraftIds] = useState<Record<number, boolean>>({})
   const [collapsedWorkerRunIds, setCollapsedWorkerRunIds] = useState<Record<number, boolean>>({})
@@ -320,10 +342,37 @@ function App() {
   }, [dashboard?.profile])
 
   useEffect(() => {
+    const savedSearches = dashboard?.saved_searches ?? []
+    if (savedSearches.length === 0) {
+      setSelectedSavedSearchId(null)
+      return
+    }
+    setSelectedSavedSearchId((current) => {
+      if (current && savedSearches.some((savedSearch) => savedSearch.id === current)) {
+        return current
+      }
+      return savedSearches.find((savedSearch) => savedSearch.is_default)?.id ?? savedSearches[0].id
+    })
+  }, [dashboard?.saved_searches])
+
+  useEffect(() => {
+    const selectedSavedSearch =
+      (dashboard?.saved_searches ?? []).find((savedSearch) => savedSearch.id === selectedSavedSearchId) ??
+      null
+    if (selectedSavedSearch) {
+      setSavedSearchName(selectedSavedSearch.name)
+      setSavedSearchCadenceMinutes(selectedSavedSearch.cadence_minutes)
+      setSavedSearchEnabled(selectedSavedSearch.enabled)
+      setSearchPreferences(normalizeSearchPreferences(selectedSavedSearch.search_preferences))
+      return
+    }
     if (dashboard?.profile?.search_preferences) {
+      setSavedSearchName('')
+      setSavedSearchCadenceMinutes(1440)
+      setSavedSearchEnabled(true)
       setSearchPreferences(normalizeSearchPreferences(dashboard.profile.search_preferences))
     }
-  }, [dashboard?.profile?.search_preferences])
+  }, [dashboard?.profile?.search_preferences, dashboard?.saved_searches, selectedSavedSearchId])
 
   useEffect(() => {
     if (!dashboard?.applications) {
@@ -375,6 +424,24 @@ function App() {
   }, [dashboard?.jobs])
 
   useEffect(() => {
+    if (!dashboard?.jobs) {
+      return
+    }
+    setCrmEditors((current) => {
+      const jobIds = new Set(dashboard.jobs.map((job) => job.id))
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([jobId]) => jobIds.has(Number(jobId))),
+      )
+      for (const job of dashboard.jobs) {
+        if (!next[job.id]) {
+          next[job.id] = createCrmEditorState(job)
+        }
+      }
+      return next
+    })
+  }, [dashboard?.jobs])
+
+  useEffect(() => {
     if (!dashboard?.worker_runs) {
       return
     }
@@ -390,6 +457,25 @@ function App() {
       setLastWorkerRun(latestRun)
     }
   }, [dashboard?.worker_runs, lastWorkerRun?.id])
+
+  useEffect(() => {
+    const hasActiveTasks = (dashboard?.background_tasks ?? []).some(
+      (task) => task.status === 'queued' || task.status === 'running',
+    )
+    if (!hasActiveTasks) {
+      return
+    }
+    const timeoutId = window.setTimeout(() => {
+      void processBackgroundTasks(1)
+        .catch(() => null)
+        .then(() => getDashboard())
+        .then((nextDashboard) => {
+          setDashboard(nextDashboard)
+        })
+        .catch(() => null)
+    }, 2500)
+    return () => window.clearTimeout(timeoutId)
+  }, [dashboard?.background_tasks])
 
   useEffect(() => {
     const applicationDraftId = lastWorkerRun?.application_draft_id
@@ -429,9 +515,59 @@ function App() {
     return () => window.clearTimeout(timeoutId)
   }, [highlightedDraftId])
 
+  const selectedSavedSearch = useMemo(() => {
+    return (
+      (dashboard?.saved_searches ?? []).find((savedSearch) => savedSearch.id === selectedSavedSearchId) ??
+      null
+    )
+  }, [dashboard?.saved_searches, selectedSavedSearchId])
+
+  const latestDiscoveryRunBySearchId = useMemo(() => {
+    const next = new Map<number, DiscoveryRunResponse>()
+    for (const run of dashboard?.discovery_runs ?? []) {
+      if (!next.has(run.saved_search_id)) {
+        next.set(run.saved_search_id, run)
+      }
+    }
+    return next
+  }, [dashboard?.discovery_runs])
+
+  const selectedDiscoveryRun = selectedSavedSearchId
+    ? latestDiscoveryRunBySearchId.get(selectedSavedSearchId) ?? null
+    : null
+
+  const selectedSearchMatchesByJobId = useMemo(() => {
+    const next = new Map<number, SavedSearchMatchResponse>()
+    for (const match of dashboard?.saved_search_matches ?? []) {
+      if (!selectedSavedSearchId || match.saved_search_id !== selectedSavedSearchId) {
+        continue
+      }
+      next.set(match.job_lead_id, match)
+    }
+    return next
+  }, [dashboard?.saved_search_matches, selectedSavedSearchId])
+
+  const selectedSearchTasks = useMemo(() => {
+    return (dashboard?.background_tasks ?? []).filter((task) => {
+      if (!selectedSavedSearchId) {
+        return false
+      }
+      return (
+        task.saved_search_id === selectedSavedSearchId ||
+        task.discovery_run_id === selectedDiscoveryRun?.id
+      )
+    })
+  }, [dashboard?.background_tasks, selectedDiscoveryRun?.id, selectedSavedSearchId])
+
   const rankedJobs = useMemo(() => {
-    return [...(dashboard?.jobs ?? [])].sort((left, right) => (right.score ?? 0) - (left.score ?? 0))
-  }, [dashboard])
+    return [...(dashboard?.jobs ?? [])]
+      .filter((job) => !selectedSavedSearchId || selectedSearchMatchesByJobId.has(job.id))
+      .sort(
+        (left, right) =>
+          getDisplayedJobScore(right, selectedSearchMatchesByJobId) -
+          getDisplayedJobScore(left, selectedSearchMatchesByJobId),
+      )
+  }, [dashboard?.jobs, selectedSavedSearchId, selectedSearchMatchesByJobId])
 
   const jobsById = useMemo(() => {
     return new Map((dashboard?.jobs ?? []).map((job) => [job.id, job]))
@@ -477,7 +613,7 @@ function App() {
     const normalizedLocationFilter = shortlistFilters.location.trim().toLowerCase()
 
     return rankedJobs.filter((job) => {
-      if ((job.score ?? 0) < shortlistFilters.minScore) {
+      if (getDisplayedJobScore(job, selectedSearchMatchesByJobId) < shortlistFilters.minScore) {
         return false
       }
       if (normalizedCompanyFilter && job.company.trim().toLowerCase() !== normalizedCompanyFilter) {
@@ -494,7 +630,7 @@ function App() {
       }
       return true
     })
-  }, [rankedJobs, shortlistFilters])
+  }, [rankedJobs, selectedSearchMatchesByJobId, shortlistFilters])
 
   const appliedShortlistCount = useMemo(() => {
     return filteredShortlist.filter((job) =>
@@ -520,9 +656,12 @@ function App() {
         if (leftPriority !== rightPriority) {
           return leftPriority - rightPriority
         }
-        return (right.score ?? 0) - (left.score ?? 0)
+        return (
+          getDisplayedJobScore(right, selectedSearchMatchesByJobId) -
+          getDisplayedJobScore(left, selectedSearchMatchesByJobId)
+        )
       })
-  }, [filteredShortlist, latestApplicationByJobId, showAppliedJobs])
+  }, [filteredShortlist, latestApplicationByJobId, selectedSearchMatchesByJobId, showAppliedJobs])
 
   const hasShortlistFilters =
     shortlistFilters.minScore !== DEFAULT_MIN_VISIBLE_SCORE ||
@@ -543,6 +682,11 @@ function App() {
   }, [dashboard?.applications, lastWorkerRun?.application_draft_id])
   const currentRunJob = currentRunDraft ? jobsById.get(currentRunDraft.job_lead_id) ?? null : null
   const statusNavItems = [
+    {
+      label: 'Saved searches',
+      value: dashboard?.saved_searches.length ?? 0,
+      targetId: 'searches-section',
+    },
     {
       label: 'Profile sources',
       value: dashboard?.profile_sources.length ?? 0,
@@ -665,7 +809,11 @@ function App() {
 
   function resetSearchPreferences() {
     setSearchPreferences(
-      normalizeSearchPreferences(dashboard?.profile?.search_preferences ?? emptySearchPreferences),
+      normalizeSearchPreferences(
+        selectedSavedSearch?.search_preferences ??
+          dashboard?.profile?.search_preferences ??
+          emptySearchPreferences,
+      ),
     )
   }
 
@@ -674,6 +822,37 @@ function App() {
       ...current,
       [source]: splitEditorLines(value),
     }))
+  }
+
+  async function persistCurrentSavedSearch(options?: {
+    normalizedPreferences?: SearchPreferencesPayload
+  }) {
+    const normalizedPreferences =
+      options?.normalizedPreferences ?? normalizeSearchPreferences(searchPreferences)
+    const draftName = savedSearchName.trim()
+    if (selectedSavedSearch) {
+      const updatedSearch = await updateSavedSearch(selectedSavedSearch.id, {
+        name: draftName || selectedSavedSearch.name,
+        search_preferences: normalizedPreferences,
+        enabled: savedSearchEnabled,
+        cadence_minutes: savedSearchCadenceMinutes,
+      })
+      setSelectedSavedSearchId(updatedSearch.id)
+      setSavedSearchName(updatedSearch.name)
+      setSearchPreferences(normalizeSearchPreferences(updatedSearch.search_preferences))
+      return updatedSearch
+    }
+
+    const createdSearch = await createSavedSearch({
+      name: buildSavedSearchName(draftName, dashboard?.saved_searches ?? []),
+      search_preferences: normalizedPreferences,
+      enabled: savedSearchEnabled,
+      cadence_minutes: savedSearchCadenceMinutes,
+    })
+    setSelectedSavedSearchId(createdSearch.id)
+    setSavedSearchName(createdSearch.name)
+    setSearchPreferences(normalizeSearchPreferences(createdSearch.search_preferences))
+    return createdSearch
   }
 
   async function handleDeleteProfileSource(sourceId: number, sourceLabel: string) {
@@ -700,20 +879,75 @@ function App() {
       if (!hasIntent) {
         throw new Error('Add at least one target title, responsibility, or keyword before discovery.')
       }
-      let result: WebJobDiscoveryResponse
+      let savedSearch: SavedSearchResponse
       try {
-        result = await discoverWebJobs(normalizedPreferences)
+        savedSearch = await persistCurrentSavedSearch({
+          normalizedPreferences,
+        })
       } catch (error) {
         throw new Error(formatDiscoveryErrorMessage(error))
       }
-      setSearchPreferences(normalizeSearchPreferences(result.search_preferences))
-      setLastWebDiscovery({
-        grounded_pages_count: result.grounded_pages_count,
-        search_queries: result.search_queries,
-        source_urls: result.source_urls,
+      await runSavedSearch(savedSearch.id)
+      return {
+        message: `Queued "${savedSearch.name}" for AI discovery in the background.`,
+        tone: 'success',
+        toast: true,
+        durationMs: 5000,
+      }
+    })
+  }
+
+  async function handleSaveCurrentSearch() {
+    await runAction('save-search', async () => {
+      const savedSearch = await persistCurrentSavedSearch()
+      return {
+        message: `Saved search "${savedSearch.name}" updated.`,
+        tone: 'success',
+        toast: true,
+      }
+    })
+  }
+
+  async function handleCreateSearchFromCurrent() {
+    await runAction('create-search', async () => {
+      const normalizedPreferences = normalizeSearchPreferences(searchPreferences)
+      const createdSearch = await createSavedSearch({
+        name: buildSavedSearchName(savedSearchName, dashboard?.saved_searches ?? []),
+        search_preferences: normalizedPreferences,
+        enabled: savedSearchEnabled,
+        cadence_minutes: savedSearchCadenceMinutes,
       })
-      const queryCount = result.search_queries.length
-      return `Discovered ${result.jobs.length} ${result.jobs.length === 1 ? 'role' : 'roles'} from ${result.grounded_pages_count} grounded ${result.grounded_pages_count === 1 ? 'page' : 'pages'}${queryCount > 0 ? ` across ${queryCount} search ${queryCount === 1 ? 'query' : 'queries'}` : ''}.`
+      setSelectedSavedSearchId(createdSearch.id)
+      return {
+        message: `Created saved search "${createdSearch.name}".`,
+        tone: 'success',
+        toast: true,
+      }
+    })
+  }
+
+  async function handleDeleteSelectedSearch() {
+    if (!selectedSavedSearch || selectedSavedSearch.is_default) {
+      updateStatus('The default saved search cannot be deleted.', {
+        tone: 'warning',
+        toast: true,
+      })
+      return
+    }
+    const confirmed = window.confirm(
+      `Delete saved search "${selectedSavedSearch.name}"? Its discovery history and per-search matches will be removed.`,
+    )
+    if (!confirmed) {
+      return
+    }
+    await runAction(`delete-search-${selectedSavedSearch.id}`, async () => {
+      await deleteSavedSearch(selectedSavedSearch.id)
+      setSelectedSavedSearchId(null)
+      return {
+        message: `Deleted saved search "${selectedSavedSearch.name}".`,
+        tone: 'success',
+        toast: true,
+      }
     })
   }
 
@@ -900,32 +1134,70 @@ function App() {
     }
 
     const busyLabel = options.confirmSubmit ? `submit-${applicationId}` : `preview-${applicationId}`
-    let completedRunId: number | null = null
     await runAction(busyLabel, async () => {
-      const result = await runWorker(applicationId, {
+      await queueWorkerRun(applicationId, {
         dry_run: options.dryRun,
         confirm_submit: options.confirmSubmit,
         cover_note: editor.cover_note,
         screening_answers: editor.screening_answers,
         answer_overrides: buildAnswerOverrides(applicationId, reviewOverrides),
       })
-      completedRunId = result.id
-      setLastWorkerRun(result)
-      seedReviewOverrides(result, setReviewOverrides)
       return {
-        message: buildWorkerStatusMessage(result),
-        tone: getWorkerToastTone(result, options.confirmSubmit),
+        message: options.confirmSubmit
+          ? 'Queued application submission in the background.'
+          : 'Queued worker preview in the background.',
+        tone: 'success',
         toast: true,
       }
     })
-    if (completedRunId !== null) {
-      const runId = completedRunId
-      setCollapsedWorkerRunIds((current) => ({
-        ...current,
-        [runId]: false,
-      }))
-      jumpToSection('worker-run-section')
+    jumpToSection('worker-run-section')
+  }
+
+  async function handleSearchFeedback(
+    jobId: number,
+    signal: 'neutral' | 'shortlisted' | 'dismissed',
+  ) {
+    if (!selectedSavedSearchId) {
+      updateStatus('Select a saved search before recording shortlist feedback.', {
+        tone: 'warning',
+        toast: true,
+      })
+      return
     }
+    await runAction(`feedback-${selectedSavedSearchId}-${jobId}-${signal}`, async () => {
+      await saveSearchFeedback(selectedSavedSearchId, jobId, { signal })
+      return {
+        message:
+          signal === 'neutral'
+            ? 'Search feedback cleared.'
+            : signal === 'shortlisted'
+              ? 'Marked role as shortlisted for this saved search.'
+              : 'Marked role as dismissed for this saved search.',
+        tone: signal === 'dismissed' ? 'warning' : 'success',
+        toast: true,
+      }
+    })
+  }
+
+  async function handleSaveJobCrm(jobId: number) {
+    const editor = crmEditors[jobId]
+    if (!editor) {
+      return
+    }
+    await runAction(`crm-${jobId}`, async () => {
+      await updateJobCrm(jobId, {
+        crm_stage: editor.crm_stage,
+        crm_notes: editor.crm_notes.trim() || null,
+        follow_up_at: editor.follow_up_at || null,
+        last_contacted_at: editor.last_contacted_at || null,
+        is_active: editor.is_active,
+      })
+      return {
+        message: 'CRM details updated for this role.',
+        tone: 'success',
+        toast: true,
+      }
+    })
   }
 
   async function handleAssistCoverNote(applicationId: number) {
@@ -1277,13 +1549,76 @@ function App() {
       </section>
 
       <section className="grid two-column">
-        <article className="panel">
+        <article className="panel" id="searches-section">
           <h2>AI Web Discovery</h2>
           <p className="panel-subtitle">
-            Experimental. Gemini grounded search uses your saved profile and explicit search intent to
-            scout for direct Greenhouse, Lever, and Ashby job pages. Use manual ATS discovery when you
-            already know the company.
+            Saved searches let you version your search intent, queue discovery in the background, and
+            inspect the latest grounded run without blocking the dashboard.
           </p>
+          <div className="profile-grid">
+            <label className="field">
+              <span>Saved search</span>
+              <select
+                value={selectedSavedSearchId ?? ''}
+                onChange={(event) =>
+                  setSelectedSavedSearchId(
+                    event.target.value ? Number(event.target.value) : null,
+                  )
+                }
+              >
+                {(dashboard?.saved_searches ?? []).map((savedSearch) => (
+                  <option key={savedSearch.id} value={savedSearch.id}>
+                    {savedSearch.name}
+                    {savedSearch.is_default ? ' (default)' : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="field">
+              <span>Search name</span>
+              <input
+                value={savedSearchName}
+                onChange={(event) => setSavedSearchName(event.target.value)}
+                placeholder="Platform Support Europe"
+              />
+            </label>
+            <label className="field">
+              <span>Cadence (hours)</span>
+              <input
+                type="number"
+                min={1}
+                max={168}
+                value={Math.max(1, Math.round(savedSearchCadenceMinutes / 60))}
+                onChange={(event) =>
+                  setSavedSearchCadenceMinutes(
+                    Math.max(60, Math.min(168 * 60, Number(event.target.value || 24) * 60)),
+                  )
+                }
+              />
+            </label>
+            <label className="field">
+              <span>Schedule</span>
+              <select
+                value={savedSearchEnabled ? 'enabled' : 'paused'}
+                onChange={(event) => setSavedSearchEnabled(event.target.value === 'enabled')}
+              >
+                <option value="enabled">Enabled</option>
+                <option value="paused">Paused</option>
+              </select>
+            </label>
+          </div>
+          {selectedSavedSearch ? (
+            <div className="job-meta-row">
+              <span>
+                {selectedSavedSearch.enabled ? 'Scheduled' : 'Paused'} every{' '}
+                {Math.max(1, Math.round(selectedSavedSearch.cadence_minutes / 60))}h
+              </span>
+              <span>Last status: {selectedSavedSearch.last_status}</span>
+              {selectedSavedSearch.next_run_at ? (
+                <span>Next run: {formatTimestamp(selectedSavedSearch.next_run_at)}</span>
+              ) : null}
+            </div>
+          ) : null}
           <div className="profile-grid">
             <label className="field">
               <span>Target titles (one per line)</span>
@@ -1390,39 +1725,91 @@ function App() {
             <button type="button" className="button-muted" onClick={() => resetSearchPreferences()}>
               Reset from profile
             </button>
+            <button
+              type="button"
+              className="button-secondary"
+              onClick={() => void handleSaveCurrentSearch()}
+              disabled={busyKey === 'save-search'}
+            >
+              {busyKey === 'save-search' ? 'Saving...' : 'Save search'}
+            </button>
+            <button
+              type="button"
+              className="button-secondary"
+              onClick={() => void handleCreateSearchFromCurrent()}
+              disabled={busyKey === 'create-search'}
+            >
+              {busyKey === 'create-search' ? 'Creating...' : 'Save as new'}
+            </button>
+            <button
+              type="button"
+              className="button-secondary"
+              onClick={() => void handleDeleteSelectedSearch()}
+              disabled={!selectedSavedSearch || selectedSavedSearch.is_default}
+            >
+              Delete search
+            </button>
             <button onClick={() => void handleWebDiscovery()} disabled={busyKey === 'discover-web'}>
-              {busyKey === 'discover-web' ? 'Discovering...' : 'Discover Jobs'}
+              {busyKey === 'discover-web' ? 'Queueing...' : 'Queue Discovery'}
             </button>
           </div>
-          {lastWebDiscovery ? (
+          {selectedSearchTasks.length > 0 ? (
+            <div className="source-list">
+              <h3>Background queue</h3>
+              {selectedSearchTasks.slice(0, 3).map((task) => (
+                <div key={task.id} className="warning-box">
+                  <strong>{task.title}</strong>
+                  <p>
+                    Status: {task.status}
+                    {task.error_message ? ` · ${task.error_message}` : ''}
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : null}
+          {selectedDiscoveryRun ? (
             <div className="source-list">
               <h3>Last grounded search</h3>
               <p className="panel-subtitle">
-                Fetched {lastWebDiscovery.grounded_pages_count} grounded{' '}
-                {lastWebDiscovery.grounded_pages_count === 1 ? 'page' : 'pages'} from{' '}
-                {lastWebDiscovery.source_urls.length} source{' '}
-                {lastWebDiscovery.source_urls.length === 1 ? 'URL' : 'URLs'}.
+                Status: {selectedDiscoveryRun.status}. Fetched {selectedDiscoveryRun.grounded_pages_count}{' '}
+                grounded {selectedDiscoveryRun.grounded_pages_count === 1 ? 'page' : 'pages'} from{' '}
+                {selectedDiscoveryRun.source_urls.length} source{' '}
+                {selectedDiscoveryRun.source_urls.length === 1 ? 'URL' : 'URLs'}.
               </p>
-              {lastWebDiscovery.search_queries.length > 0 ? (
+              {selectedDiscoveryRun.search_queries.length > 0 ? (
                 <label className="field">
                   <span>Gemini search queries</span>
                   <textarea
                     readOnly
-                    rows={Math.min(6, Math.max(3, lastWebDiscovery.search_queries.length))}
-                    value={lastWebDiscovery.search_queries.join('\n')}
+                    rows={Math.min(6, Math.max(3, selectedDiscoveryRun.search_queries.length))}
+                    value={selectedDiscoveryRun.search_queries.join('\n')}
                   />
                 </label>
               ) : null}
-              {lastWebDiscovery.source_urls.length > 0 ? (
+              {selectedDiscoveryRun.source_urls.length > 0 ? (
                 <label className="field">
                   <span>Grounded source URLs</span>
                   <textarea
                     readOnly
-                    rows={Math.min(8, Math.max(3, lastWebDiscovery.source_urls.length))}
-                    value={lastWebDiscovery.source_urls.join('\n')}
+                    rows={Math.min(8, Math.max(3, selectedDiscoveryRun.source_urls.length))}
+                    value={selectedDiscoveryRun.source_urls.join('\n')}
                   />
                 </label>
               ) : null}
+              <div className="job-meta-row">
+                <span>
+                  Candidates:{' '}
+                  {String(selectedDiscoveryRun.diagnostics?.candidate_count ?? 0)}
+                </span>
+                <span>
+                  Accepted jobs:{' '}
+                  {String(selectedDiscoveryRun.diagnostics?.accepted_job_count ?? 0)}
+                </span>
+                <span>
+                  Rejected pages:{' '}
+                  {String(selectedDiscoveryRun.diagnostics?.rejected_pages_count ?? 0)}
+                </span>
+              </div>
             </div>
           ) : null}
         </article>
@@ -1485,6 +1872,9 @@ function App() {
           </div>
           <div className="header-actions">
             <div className="header-badges">
+              {selectedSavedSearch ? (
+                <span className="count-badge">{selectedSavedSearch.name}</span>
+              ) : null}
               <span className="count-badge">
                 {hasShortlistFilters
                   ? `${shortlist.length} of ${rankedJobs.length} roles`
@@ -1640,7 +2030,11 @@ function App() {
             <div className="card-grid card-grid-panel">
               {shortlist.map((job) => {
                 const isExpanded = expandedJobIds[job.id] ?? false
-                const fitScore = Math.round(job.score ?? 0)
+                const selectedMatch = selectedSearchMatchesByJobId.get(job.id) ?? null
+                const fitScore = Math.round(getDisplayedJobScore(job, selectedSearchMatchesByJobId))
+                const scoreDetails = selectedMatch?.score_details ?? job.score_details
+                const feedbackState = selectedMatch?.feedback_state ?? 'neutral'
+                const crmEditor = crmEditors[job.id] ?? createCrmEditorState(job)
                 const linkedApplication = latestApplicationByJobId.get(job.id) ?? null
                 const trackedJobStatus = getTrackedJobStatus(job, linkedApplication)
                 const isAppliedJob = isRecordedApplicationStatus(trackedJobStatus)
@@ -1656,11 +2050,21 @@ function App() {
                         <p className="job-card-company">
                           {job.company} · {formatJobSource(job.source)}
                         </p>
-                        {trackedJobStatus ? (
+                        {trackedJobStatus || feedbackState !== 'neutral' || !job.is_active ? (
                           <div className="job-card-status-row">
-                            <span className={getWorkerStatusBadgeClassName(trackedJobStatus)}>
-                              {formatWorkerStatus(trackedJobStatus)}
-                            </span>
+                            {trackedJobStatus ? (
+                              <span className={getWorkerStatusBadgeClassName(trackedJobStatus)}>
+                                {formatWorkerStatus(trackedJobStatus)}
+                              </span>
+                            ) : null}
+                            {feedbackState !== 'neutral' ? (
+                              <span className={getFeedbackBadgeClassName(feedbackState)}>
+                                {formatFeedbackState(feedbackState)}
+                              </span>
+                            ) : null}
+                            {!job.is_active ? (
+                              <span className="count-badge count-badge-warning">Inactive</span>
+                            ) : null}
                           </div>
                         ) : null}
                       </div>
@@ -1677,18 +2081,19 @@ function App() {
                     <div className="job-meta-row">
                       <span>{job.location || 'Location not listed'}</span>
                       {getWorkplaceLabel(job) ? <span>{getWorkplaceLabel(job)}</span> : null}
+                      <span>{job.discovery_method === 'gemini_grounded_search' ? 'AI discovery' : 'Direct ATS'}</span>
                     </div>
                     <p className={`job-summary ${isExpanded ? '' : 'job-summary-collapsed'}`.trim()}>
-                      {job.score_details?.summary ??
+                      {scoreDetails?.summary ??
                         'Run discovery after uploading a CV to see ranking details.'}
                     </p>
                     {isExpanded ? (
                       <>
-                        {(job.score_details?.matched_signals?.length ?? 0) > 0 ? (
+                        {(scoreDetails?.matched_signals?.length ?? 0) > 0 ? (
                           <div className="signal-block">
                             <span className="signal-label">Why it matches</span>
                             <div className="tag-row">
-                              {(job.score_details?.matched_signals ?? []).slice(0, 4).map((signal) => (
+                              {(scoreDetails?.matched_signals ?? []).slice(0, 4).map((signal) => (
                                 <span key={signal} className="tag">
                                   {signal}
                                 </span>
@@ -1699,7 +2104,7 @@ function App() {
                           <div className="signal-block">
                             <span className="signal-label">Key skills</span>
                             <div className="tag-row">
-                              {(job.score_details?.matched_skills ?? []).slice(0, 4).map((skill) => (
+                              {(scoreDetails?.matched_skills ?? []).slice(0, 4).map((skill) => (
                                 <span key={skill} className="tag">
                                   {skill}
                                 </span>
@@ -1707,10 +2112,10 @@ function App() {
                             </div>
                           </div>
                         )}
-                        {(job.score_details?.missing_signals?.length ?? 0) > 0 ? (
+                        {(scoreDetails?.missing_signals?.length ?? 0) > 0 ? (
                           <div className="warning-box">
                             <span className="signal-label">Watchouts</span>
-                            <p>{(job.score_details?.missing_signals ?? []).slice(0, 2).join(' · ')}</p>
+                            <p>{(scoreDetails?.missing_signals ?? []).slice(0, 2).join(' · ')}</p>
                           </div>
                         ) : null}
                         {job.research?.github_summary || job.research?.website_summary ? (
@@ -1719,6 +2124,117 @@ function App() {
                             <p>{job.research.website_summary || job.research.github_summary}</p>
                           </div>
                         ) : null}
+                        <div className="research-box">
+                          <strong>Discovery</strong>
+                          <p>
+                            Method: {job.discovery_method.replace(/_/g, ' ')} · First seen:{' '}
+                            {formatTimestamp(job.first_seen_at)} · Last seen:{' '}
+                            {formatTimestamp(job.last_seen_at)}
+                          </p>
+                          {getDiscoveryWhyMatch(job) ? <p>{getDiscoveryWhyMatch(job)}</p> : null}
+                        </div>
+                        <div className="signal-block">
+                          <span className="signal-label">CRM</span>
+                          <div className="profile-grid">
+                            <label className="field field-compact">
+                              <span>Stage</span>
+                              <select
+                                value={crmEditor.crm_stage}
+                                onChange={(event) =>
+                                  setCrmEditors((current) => ({
+                                    ...current,
+                                    [job.id]: {
+                                      ...crmEditor,
+                                      crm_stage: event.target.value as CrmEditorState['crm_stage'],
+                                    },
+                                  }))
+                                }
+                              >
+                                {[
+                                  'new',
+                                  'shortlisted',
+                                  'drafted',
+                                  'applied',
+                                  'interviewing',
+                                  'offer',
+                                  'rejected',
+                                  'archived',
+                                ].map((stage) => (
+                                  <option key={stage} value={stage}>
+                                    {stage}
+                                  </option>
+                                ))}
+                              </select>
+                            </label>
+                            <label className="field field-compact">
+                              <span>Follow up</span>
+                              <input
+                                type="datetime-local"
+                                value={crmEditor.follow_up_at}
+                                onChange={(event) =>
+                                  setCrmEditors((current) => ({
+                                    ...current,
+                                    [job.id]: { ...crmEditor, follow_up_at: event.target.value },
+                                  }))
+                                }
+                              />
+                            </label>
+                            <label className="field field-compact">
+                              <span>Last contacted</span>
+                              <input
+                                type="datetime-local"
+                                value={crmEditor.last_contacted_at}
+                                onChange={(event) =>
+                                  setCrmEditors((current) => ({
+                                    ...current,
+                                    [job.id]: { ...crmEditor, last_contacted_at: event.target.value },
+                                  }))
+                                }
+                              />
+                            </label>
+                            <label className="field field-compact">
+                              <span>Active</span>
+                              <select
+                                value={crmEditor.is_active ? 'active' : 'inactive'}
+                                onChange={(event) =>
+                                  setCrmEditors((current) => ({
+                                    ...current,
+                                    [job.id]: {
+                                      ...crmEditor,
+                                      is_active: event.target.value === 'active',
+                                    },
+                                  }))
+                                }
+                              >
+                                <option value="active">Active</option>
+                                <option value="inactive">Inactive</option>
+                              </select>
+                            </label>
+                          </div>
+                          <label className="field field-compact">
+                            <span>Notes</span>
+                            <textarea
+                              rows={3}
+                              value={crmEditor.crm_notes}
+                              onChange={(event) =>
+                                setCrmEditors((current) => ({
+                                  ...current,
+                                  [job.id]: { ...crmEditor, crm_notes: event.target.value },
+                                }))
+                              }
+                            />
+                          </label>
+                          <div className="field-actions">
+                            <button
+                              type="button"
+                              className="button-secondary button-small"
+                              onClick={() => void handleSaveJobCrm(job.id)}
+                              disabled={busyKey === `crm-${job.id}`}
+                            >
+                              {busyKey === `crm-${job.id}` ? 'Saving CRM...' : 'Save CRM'}
+                            </button>
+                          </div>
+                        </div>
                       </>
                     ) : null}
                     <div className="button-row job-actions">
@@ -1750,6 +2266,31 @@ function App() {
                           {busyKey === `draft-${job.id}` ? 'Drafting...' : 'Create Draft'}
                         </button>
                       )}
+                      {selectedSavedSearchId ? (
+                        <>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={() => void handleSearchFeedback(job.id, 'shortlisted')}
+                          >
+                            Shortlist
+                          </button>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={() => void handleSearchFeedback(job.id, 'dismissed')}
+                          >
+                            Dismiss
+                          </button>
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            onClick={() => void handleSearchFeedback(job.id, 'neutral')}
+                          >
+                            Reset feedback
+                          </button>
+                        </>
+                      ) : null}
                       <button
                         type="button"
                         className="button-secondary"
@@ -2392,6 +2933,16 @@ function createDraftEditorState(application: ApplicationDraftResponse): DraftEdi
   }
 }
 
+function createCrmEditorState(job: JobLeadResponse): CrmEditorState {
+  return {
+    crm_stage: job.crm_stage,
+    crm_notes: job.crm_notes ?? '',
+    follow_up_at: formatDateTimeLocalValue(job.follow_up_at),
+    last_contacted_at: formatDateTimeLocalValue(job.last_contacted_at),
+    is_active: job.is_active,
+  }
+}
+
 function createDraftEditorStateFromId(
   applicationId: number,
   dashboard: DashboardResponse | null,
@@ -2407,77 +2958,6 @@ function buildAnswerOverrides(
   return Object.entries(reviewOverrides[applicationId] ?? {})
     .map(([field_id, value]) => ({ field_id, value: value.trim() }))
     .filter((item) => item.value.length > 0)
-}
-
-function seedReviewOverrides(
-  result: WorkerRunResponse,
-  setReviewOverrides: Dispatch<SetStateAction<Record<number, Record<string, string>>>>,
-) {
-  if (!result.application_draft_id) {
-    return
-  }
-  setReviewOverrides((current) => {
-    const next = { ...(current[result.application_draft_id!] ?? {}) }
-    for (const field of result.review_items) {
-      next[field.field_id] = field.answer_value ?? current[result.application_draft_id!]?.[field.field_id] ?? ''
-    }
-    return { ...current, [result.application_draft_id!]: next }
-  })
-}
-
-function buildWorkerStatusMessage(result: WorkerRunResponse) {
-  if (result.status === 'awaiting_answers') {
-    return `Preview found ${result.preview_summary.review_required_count} review item${result.preview_summary.review_required_count === 1 ? '' : 's'} before submission.`
-  }
-  if (result.status === 'preview_ready') {
-    return `Preview ready with ${result.preview_summary.autofill_ready_count} autofill-ready fields.`
-  }
-  if (result.status === 'ready_for_submit') {
-    if (result.logs.some((log) => log.includes('skipped final submit'))) {
-      return 'Application was not sent because at least one field could not be applied.'
-    }
-    if (result.logs.some((log) => log.includes('Submit button was not detected'))) {
-      return 'Application was not sent. Fields were filled, but the submit button was not detected.'
-    }
-    return 'Fields were filled and the application is ready for final submit review.'
-  }
-  if (result.status === 'submit_clicked') {
-    return 'Submit was clicked, but ATS confirmation was not detected. Review the final page state.'
-  }
-  if (result.status === 'submitted') {
-    return 'Application submission was confirmed by the ATS.'
-  }
-  if (result.status === 'failed') {
-    return 'The worker failed while extracting or filling the application.'
-  }
-  return 'Worker run completed.'
-}
-
-function getWorkerToastTone(result: WorkerRunResponse, requestedSubmit: boolean): ToastTone {
-  if (result.status === 'submitted') {
-    return 'success'
-  }
-  if (result.status === 'submit_clicked') {
-    return 'warning'
-  }
-  if (result.status === 'failed') {
-    return 'error'
-  }
-  if (result.status === 'awaiting_answers') {
-    return 'warning'
-  }
-  if (result.status === 'ready_for_submit') {
-    if (
-      result.logs.some(
-        (log) =>
-          log.includes('skipped final submit') || log.includes('Submit button was not detected'),
-      )
-    ) {
-      return 'error'
-    }
-    return requestedSubmit ? 'warning' : 'success'
-  }
-  return 'success'
 }
 
 function getToastToneLabel(tone: ToastTone) {
@@ -2584,6 +3064,12 @@ function formatAnswerSource(source: string) {
 }
 
 function formatWorkerStatus(status: string) {
+  if (status === 'queued') {
+    return 'Queued'
+  }
+  if (status === 'running') {
+    return 'Running'
+  }
   if (status === 'preview_ready') {
     return 'Preview ready'
   }
@@ -2613,9 +3099,37 @@ function getWorkerStatusBadgeClassName(status?: string | null) {
         ? 'error'
         : status === 'submit_clicked' || status === 'awaiting_answers'
           ? 'warning'
+          : status === 'queued' || status === 'running'
+            ? 'info'
           : null
 
   return tone ? `count-badge count-badge-${tone}` : 'count-badge'
+}
+
+function getFeedbackBadgeClassName(state: string) {
+  const tone =
+    state === 'dismissed'
+      ? 'warning'
+      : state === 'shortlisted' || state === 'drafted' || state === 'applied'
+        ? 'success'
+        : null
+  return tone ? `count-badge count-badge-${tone}` : 'count-badge'
+}
+
+function formatFeedbackState(state: string) {
+  if (state === 'shortlisted') {
+    return 'Shortlisted'
+  }
+  if (state === 'dismissed') {
+    return 'Dismissed'
+  }
+  if (state === 'drafted') {
+    return 'Drafted'
+  }
+  if (state === 'applied') {
+    return 'Applied'
+  }
+  return state.replace(/_/g, ' ')
 }
 
 function canAssistField(field: WorkerFieldState) {
@@ -2674,6 +3188,29 @@ function normalizeSearchPreferenceItems(values: string[] | undefined) {
   return values
     .map((value) => value.trim())
     .filter(Boolean)
+}
+
+function buildSavedSearchName(candidateName: string, savedSearches: SavedSearchResponse[]) {
+  const trimmedName = candidateName.trim()
+  const existingNames = new Set(savedSearches.map((savedSearch) => savedSearch.name.toLowerCase()))
+  if (trimmedName && !existingNames.has(trimmedName.toLowerCase())) {
+    return trimmedName
+  }
+  const baseName = trimmedName || 'Saved search'
+  let suffix = trimmedName ? 2 : savedSearches.length + 1
+  let nextName = trimmedName || `${baseName} ${suffix}`
+  while (existingNames.has(nextName.toLowerCase())) {
+    suffix += 1
+    nextName = `${baseName} ${suffix}`
+  }
+  return nextName
+}
+
+function getDisplayedJobScore(
+  job: JobLeadResponse,
+  matchLookup: Map<number, SavedSearchMatchResponse>,
+) {
+  return matchLookup.get(job.id)?.current_score ?? job.score ?? 0
 }
 
 function getFitLabel(score: number) {
@@ -2760,6 +3297,38 @@ function getErrorMessage(error: unknown) {
     return error.message
   }
   return 'Something went wrong while contacting the API.'
+}
+
+function formatTimestamp(value?: string | null) {
+  if (!value) {
+    return 'Never'
+  }
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return value
+  }
+  return parsed.toLocaleString()
+}
+
+function formatDateTimeLocalValue(value?: string | null) {
+  if (!value) {
+    return ''
+  }
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return ''
+  }
+  const offsetMs = parsed.getTimezoneOffset() * 60_000
+  return new Date(parsed.getTime() - offsetMs).toISOString().slice(0, 16)
+}
+
+function getDiscoveryWhyMatch(job: JobLeadResponse) {
+  const discovery = job.metadata_json['discovery']
+  if (!discovery || typeof discovery !== 'object') {
+    return null
+  }
+  const whyMatch = (discovery as Record<string, unknown>).why_match
+  return typeof whyMatch === 'string' && whyMatch.trim().length > 0 ? whyMatch : null
 }
 
 function formatDiscoveryErrorMessage(error: unknown) {

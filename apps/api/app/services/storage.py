@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -13,12 +15,17 @@ from apps.api.app.schemas import (
 )
 from apps.api.app.services.matching import rank_job
 from apps.api.app.services.profile_sources.linkedin_profile import merge_profile_payloads
+from apps.api.app.services.saved_searches import (
+    list_saved_searches,
+    rerank_saved_search_matches,
+    sync_default_saved_search,
+)
 from apps.api.app.services.search_preferences import normalize_search_preferences, seed_search_preferences
 
 
 def get_latest_profile(session: Session) -> CandidateProfile | None:
     return session.execute(
-        select(CandidateProfile).order_by(CandidateProfile.id.desc())
+        select(CandidateProfile).order_by(CandidateProfile.id.desc()).limit(1)
     ).scalar_one_or_none()
 
 
@@ -71,6 +78,7 @@ def save_profile_source(
         search_preferences = seed_search_preferences(merged_payload)
         profile.search_preferences_customized = False
     profile.search_preferences = search_preferences.model_dump(mode="json")
+    sync_default_saved_search(session, profile, search_preferences)
     rerank_all_jobs(session, merged_payload, search_preferences)
 
     source = ProfileSource(
@@ -112,6 +120,7 @@ def update_profile_manually(session: Session, payload: ProfileUpdateRequest) -> 
         search_preferences = seed_search_preferences(payload)
         profile.search_preferences_customized = False
     profile.search_preferences = search_preferences.model_dump(mode="json")
+    sync_default_saved_search(session, profile, search_preferences)
     rerank_all_jobs(session, payload, search_preferences)
     session.commit()
     session.refresh(profile)
@@ -132,6 +141,11 @@ def update_search_preferences(
         session.flush()
     profile.search_preferences = normalize_search_preferences(payload).model_dump(mode="json")
     profile.search_preferences_customized = True
+    search_preferences = get_search_preferences(profile)
+    sync_default_saved_search(session, profile, search_preferences)
+    profile_payload = get_profile_payload(profile)
+    if profile_payload is not None:
+        rerank_all_jobs(session, profile_payload, search_preferences)
     session.commit()
     session.refresh(profile)
     return profile
@@ -195,6 +209,7 @@ def delete_profile_source(session: Session, source_id: int) -> dict[str, int] | 
 
 
 def upsert_job_lead(session: Session, payload: dict) -> JobLead:
+    now = datetime.now(UTC)
     existing = session.execute(
         select(JobLead).where(
             JobLead.source == payload["source"], JobLead.external_id == str(payload["external_id"])
@@ -206,12 +221,41 @@ def upsert_job_lead(session: Session, payload: dict) -> JobLead:
         ).scalar_one_or_none()
     if existing:
         for field_name, value in payload.items():
+            if field_name in {
+                "crm_stage",
+                "crm_notes",
+                "follow_up_at",
+                "last_contacted_at",
+                "first_seen_at",
+                "last_seen_at",
+                "last_checked_at",
+                "closed_at",
+                "is_active",
+            }:
+                continue
+            if (
+                field_name == "status"
+                and value == "discovered"
+                and existing.status in {"submitted", "submit_clicked"}
+            ):
+                continue
             setattr(existing, field_name, value)
+        existing.last_seen_at = now
+        existing.last_checked_at = now
+        existing.is_active = True
+        if existing.closed_at is not None:
+            existing.closed_at = None
         session.commit()
         session.refresh(existing)
         return existing
 
-    job = JobLead(**payload)
+    job = JobLead(
+        **payload,
+        first_seen_at=now,
+        last_seen_at=now,
+        last_checked_at=now,
+        is_active=True,
+    )
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -221,7 +265,11 @@ def upsert_job_lead(session: Session, payload: dict) -> JobLead:
 def list_jobs(session: Session) -> list[JobLead]:
     return list(
         session.execute(
-            select(JobLead).order_by(JobLead.score.desc().nullslast(), JobLead.id.desc())
+            select(JobLead).order_by(
+                JobLead.score.desc().nullslast(),
+                JobLead.last_seen_at.desc().nullslast(),
+                JobLead.id.desc(),
+            )
         ).scalars()
     )
 
@@ -306,6 +354,13 @@ def rerank_all_jobs(
         ranking = rank_job(profile_payload, _job_to_payload(job), ranking_preferences)
         job.score = ranking.score
         job.score_details = ranking.model_dump(mode="json")
+    profile = get_latest_profile(session)
+    if profile is not None:
+        rerank_saved_search_matches(
+            session,
+            profile_payload=profile_payload,
+            saved_searches=list_saved_searches(session, profile.id),
+        )
 
 
 def _delete_application_draft_records(session: Session, draft: ApplicationDraft) -> int:
@@ -360,6 +415,7 @@ def _rebuild_profile_after_source_delete(
             search_preferences = seed_search_preferences(merged_profile)
             profile.search_preferences_customized = False
         profile.search_preferences = search_preferences.model_dump(mode="json")
+        sync_default_saved_search(session, profile, search_preferences)
         rerank_all_jobs(session, merged_profile, search_preferences)
         return
 
@@ -382,6 +438,7 @@ def _rebuild_profile_after_source_delete(
         search_preferences = seed_search_preferences(merged_payload)
         profile.search_preferences_customized = False
     profile.search_preferences = search_preferences.model_dump(mode="json")
+    sync_default_saved_search(session, profile, search_preferences)
     rerank_all_jobs(session, merged_payload, search_preferences)
 
 

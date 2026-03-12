@@ -6,14 +6,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from apps.api.app.config import settings
-from apps.api.app.db import Base, engine, ensure_runtime_schema
-from apps.api.app.routers import applications, jobs, meta, profiles
+from apps.api.app.db import migrate_database
+from apps.api.app.routers import applications, jobs, meta, profiles, searches, tasks
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    Base.metadata.create_all(bind=engine)
-    ensure_runtime_schema()
+    migrate_database()
     yield
 
 
@@ -30,3 +29,5 @@ app.include_router(meta.router)
 app.include_router(profiles.router)
 app.include_router(jobs.router)
 app.include_router(applications.router)
+app.include_router(searches.router)
+app.include_router(tasks.router)

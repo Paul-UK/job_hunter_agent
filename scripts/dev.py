@@ -17,13 +17,15 @@ API_CMD = [
     "--port",
     "8000",
 ]
+ORCHESTRATOR_CMD = ["uv", "run", "python", "scripts/orchestrator.py"]
 WEB_CMD = ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
 
 
 def main() -> int:
     api = subprocess.Popen(API_CMD, cwd=ROOT)
+    orchestrator = subprocess.Popen(ORCHESTRATOR_CMD, cwd=ROOT)
     web = subprocess.Popen(WEB_CMD, cwd=ROOT / "apps" / "web")
-    children = [api, web]
+    children = [api, orchestrator, web]
 
     def shutdown(_signum, _frame):
         for child in children:
