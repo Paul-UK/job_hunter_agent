@@ -14,13 +14,12 @@ from apps.api.app.schemas import (
     ApplicationDraftAssistRequest,
     ApplicationDraftAssistResponse,
     ApplicationDraftResponse,
-    ApplicationDraftWorkerPayload,
     ApplicationRunRequest,
+    BackgroundTaskResponse,
     DeleteResponse,
-    JobLeadWorkerPayload,
-    WorkerRunRequest,
     WorkerRunResponse,
 )
+from apps.api.app.services.background_tasks import enqueue_worker_task
 from apps.api.app.services.ai_drafting import suggest_application_text
 from apps.api.app.services.llm import get_llm_client
 from apps.api.app.services.matching import rank_job
@@ -29,8 +28,14 @@ from apps.api.app.services.storage import (
     delete_worker_run,
     get_latest_profile,
     get_profile_payload,
+    get_search_preferences,
     list_applications,
     list_worker_runs,
+)
+from apps.api.app.services.worker_runs import (
+    build_worker_request,
+    create_worker_run_placeholder,
+    persist_worker_result,
 )
 from apps.worker.main import run_worker
 
@@ -104,7 +109,7 @@ def assist_application_text(
 
     llm_client = get_llm_client()
     job_payload = _job_to_payload(job)
-    ranking = rank_job(profile_payload, job_payload)
+    ranking = rank_job(profile_payload, job_payload, get_search_preferences(profile))
     suggestion = suggest_application_text(
         target=payload.target,
         profile=profile_payload,
@@ -171,79 +176,45 @@ def run_application(
     ).scalar_one_or_none()
     if draft is None:
         raise HTTPException(status_code=404, detail="Application draft not found.")
+    try:
+        worker_request, job = build_worker_request(session, draft=draft, payload=payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    profile = get_latest_profile(session)
-    profile_payload = get_profile_payload(profile)
-    if profile is None or profile_payload is None:
-        raise HTTPException(
-            status_code=400, detail="Profile data is required before running the worker."
-        )
-
-    job = draft.job_lead
-    if job is None:
-        raise HTTPException(
-            status_code=400, detail="Application draft is missing a linked job lead."
-        )
-
-    if payload.cover_note is not None:
-        draft.cover_note = payload.cover_note
-    if payload.screening_answers is not None:
-        draft.screening_answers = [answer.model_dump(mode="json") for answer in payload.screening_answers]
-
-    draft_payload = ApplicationDraftWorkerPayload(
-        tailored_summary=draft.tailored_summary,
-        cover_note=draft.cover_note,
-        resume_bullets=draft.resume_bullets,
-        screening_answers=draft.screening_answers,
+    worker_run = create_worker_run_placeholder(
+        session,
+        draft=draft,
+        worker_request=worker_request,
+        status="running",
     )
-    job_payload = JobLeadWorkerPayload(
-        source=job.source,
-        company=job.company,
-        title=job.title,
-        location=job.location,
-        employment_type=job.employment_type,
-        url=job.url,
-        description=job.description,
-        requirements=job.requirements,
-        metadata_json=job.metadata_json,
-    )
-    worker_request = WorkerRunRequest(
-        application_draft_id=draft.id,
-        target_url=job.url,
-        platform=job.source if job.source in {"greenhouse", "lever", "ashbyhq"} else "generic",
-        profile=profile_payload,
-        job=job_payload,
-        draft=draft_payload,
-        answer_overrides=payload.answer_overrides,
-        dry_run=payload.dry_run,
-        confirm_submit=payload.confirm_submit,
-        fixture_html=payload.fixture_html,
-    )
+    session.commit()
 
     result = run_worker(worker_request)
-    worker_run = WorkerRun(
-        application_draft_id=draft.id,
-        platform=result["platform"],
-        target_url=result["target_url"],
-        dry_run=result["dry_run"],
-        status=result["status"],
-        actions=result["actions"],
-        logs=result["logs"],
-        fields=result["fields"],
-        review_items=result["review_items"],
-        preview_summary=result["preview_summary"],
-        profile_snapshot=result["profile_snapshot"],
-        job_snapshot=result["job_snapshot"],
-        draft_snapshot=result["draft_snapshot"],
-        screenshot_path=result["screenshot_path"],
-    )
-    draft.status = result["status"]
-    if result["status"] in {"submitted", "submit_clicked"}:
-        job.status = result["status"]
-    session.add(worker_run)
+    persist_worker_result(session, worker_run=worker_run, draft=draft, job=job, result=result)
     session.commit()
     session.refresh(worker_run)
     return worker_run
+
+
+@router.post("/{application_id}/queue-run", response_model=BackgroundTaskResponse)
+def queue_application_run(
+    application_id: int,
+    payload: ApplicationRunRequest,
+    session: Session = Depends(get_session),
+) -> BackgroundTaskResponse:
+    draft = session.execute(
+        select(ApplicationDraft).where(ApplicationDraft.id == application_id)
+    ).scalar_one_or_none()
+    if draft is None:
+        raise HTTPException(status_code=404, detail="Application draft not found.")
+
+    try:
+        task, _worker_run = enqueue_worker_task(session, draft=draft, payload=payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    session.commit()
+    session.refresh(task)
+    return task
 
 
 def _job_to_payload(job) -> dict:

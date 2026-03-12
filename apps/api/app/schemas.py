@@ -81,6 +81,42 @@ class WebJobDiscoveryRequest(BaseModel):
     search_preferences: SearchPreferencesPayload
 
 
+class SavedSearchCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    search_preferences: SearchPreferencesPayload
+    enabled: bool = True
+    cadence_minutes: int = Field(default=1440, ge=15, le=7 * 24 * 60)
+
+
+class SavedSearchUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    search_preferences: SearchPreferencesPayload | None = None
+    enabled: bool | None = None
+    cadence_minutes: int | None = Field(default=None, ge=15, le=7 * 24 * 60)
+
+
+class SavedSearchMatchFeedbackRequest(BaseModel):
+    signal: Literal["neutral", "shortlisted", "dismissed", "drafted", "applied"]
+    note: str | None = None
+
+
+class JobLeadCrmUpdateRequest(BaseModel):
+    crm_stage: Literal[
+        "new",
+        "shortlisted",
+        "drafted",
+        "applied",
+        "interviewing",
+        "offer",
+        "rejected",
+        "archived",
+    ] | None = None
+    crm_notes: str | None = None
+    follow_up_at: datetime | None = None
+    last_contacted_at: datetime | None = None
+    is_active: bool | None = None
+
+
 class JobLeadBulkDeleteRequest(BaseModel):
     job_ids: list[int] = Field(default_factory=list)
 
@@ -112,6 +148,103 @@ class JobLeadResponse(BaseModel):
     metadata_json: dict[str, Any] = Field(default_factory=dict)
     score_details: dict[str, Any] = Field(default_factory=dict)
     research: dict[str, Any] = Field(default_factory=dict)
+    crm_stage: str = "new"
+    crm_notes: str | None = None
+    follow_up_at: datetime | None = None
+    last_contacted_at: datetime | None = None
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    last_checked_at: datetime | None = None
+    closed_at: datetime | None = None
+    is_active: bool = True
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class SavedSearchResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    profile_id: int
+    name: str
+    search_preferences: SearchPreferencesPayload = Field(default_factory=SearchPreferencesPayload)
+    enabled: bool = True
+    is_default: bool = False
+    cadence_minutes: int = 1440
+    last_run_at: datetime | None = None
+    last_success_at: datetime | None = None
+    next_run_at: datetime | None = None
+    last_status: str = "idle"
+    last_error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class DiscoveryRunResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    saved_search_id: int
+    profile_id: int
+    trigger_kind: str
+    status: str
+    model_name: str | None = None
+    search_preferences_snapshot: SearchPreferencesPayload = Field(
+        default_factory=SearchPreferencesPayload
+    )
+    search_queries: list[str] = Field(default_factory=list)
+    source_urls: list[str] = Field(default_factory=list)
+    grounded_pages_count: int = 0
+    jobs_created_count: int = 0
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class SavedSearchMatchResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    saved_search_id: int
+    job_lead_id: int
+    discovery_run_id: int | None = None
+    current_score: float | None = None
+    score_details: dict[str, Any] = Field(default_factory=dict)
+    feedback_state: str = "neutral"
+    feedback_note: str | None = None
+    last_feedback_at: datetime | None = None
+    first_seen_at: datetime | None = None
+    last_seen_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class BackgroundTaskResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    task_type: str
+    title: str
+    status: str
+    profile_id: int | None = None
+    saved_search_id: int | None = None
+    discovery_run_id: int | None = None
+    application_draft_id: int | None = None
+    worker_run_id: int | None = None
+    payload_json: dict[str, Any] = Field(default_factory=dict)
+    result_json: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    scheduled_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    heartbeat_at: datetime | None = None
+    attempt_count: int = 0
+    max_attempts: int = 0
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class WebJobDiscoveryResponse(BaseModel):
@@ -301,6 +434,7 @@ class WorkerRunResponse(BaseModel):
     job_snapshot: dict[str, Any] = Field(default_factory=dict)
     draft_snapshot: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 class DashboardResponse(BaseModel):
@@ -309,3 +443,7 @@ class DashboardResponse(BaseModel):
     jobs: list[JobLeadResponse] = Field(default_factory=list)
     applications: list[ApplicationDraftResponse] = Field(default_factory=list)
     worker_runs: list[WorkerRunResponse] = Field(default_factory=list)
+    saved_searches: list[SavedSearchResponse] = Field(default_factory=list)
+    discovery_runs: list[DiscoveryRunResponse] = Field(default_factory=list)
+    saved_search_matches: list[SavedSearchMatchResponse] = Field(default_factory=list)
+    background_tasks: list[BackgroundTaskResponse] = Field(default_factory=list)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import logging
 
 import httpx
@@ -14,6 +15,7 @@ from apps.api.app.schemas import (
     BulkDeleteResponse,
     DeleteResponse,
     JobDiscoveryRequest,
+    JobLeadCrmUpdateRequest,
     JobLeadBulkDeleteRequest,
     JobLeadResponse,
     LinkedinLeadRequest,
@@ -30,6 +32,11 @@ from apps.api.app.services.job_sources.greenhouse import fetch_greenhouse_jobs
 from apps.api.app.services.job_sources.lever import fetch_lever_jobs
 from apps.api.app.services.job_sources.linkedin import create_linkedin_lead
 from apps.api.app.services.matching import rank_job
+from apps.api.app.services.saved_searches import (
+    apply_feedback_for_job,
+    sync_default_saved_search,
+    upsert_saved_search_match,
+)
 from apps.api.app.services.storage import (
     delete_job_lead,
     delete_job_leads,
@@ -178,6 +185,14 @@ def draft_application(
     if profile is None or profile_payload is None:
         raise HTTPException(status_code=400, detail="Upload a CV before drafting applications.")
 
+    existing_draft = session.execute(
+        select(ApplicationDraft)
+        .where(ApplicationDraft.profile_id == profile.id, ApplicationDraft.job_lead_id == job.id)
+        .limit(1)
+    ).scalar_one_or_none()
+    if existing_draft is not None:
+        return existing_draft
+
     ranking = rank_job(profile_payload, job_to_payload(job), search_preferences)
     job.score = ranking.score
     job.score_details = ranking.model_dump(mode="json")
@@ -198,10 +213,41 @@ def draft_application(
         resume_bullets=draft_payload["resume_bullets"],
         screening_answers=draft_payload["screening_answers"],
     )
+    job.crm_stage = "drafted"
     session.add(draft)
+    apply_feedback_for_job(session, job_id=job.id, signal="drafted")
     session.commit()
     session.refresh(draft)
     return draft
+
+
+@router.patch("/{job_id}/crm", response_model=JobLeadResponse)
+def update_job_crm(
+    job_id: int,
+    payload: JobLeadCrmUpdateRequest,
+    session: Session = Depends(get_session),
+) -> JobLeadResponse:
+    job = _get_job(session, job_id)
+    if payload.crm_stage is not None:
+        job.crm_stage = payload.crm_stage
+    if payload.crm_notes is not None:
+        job.crm_notes = payload.crm_notes
+    if payload.follow_up_at is not None:
+        job.follow_up_at = payload.follow_up_at
+    if payload.last_contacted_at is not None:
+        job.last_contacted_at = payload.last_contacted_at
+    if payload.is_active is not None:
+        job.is_active = payload.is_active
+
+    if job.crm_stage in {"rejected", "archived"} or job.is_active is False:
+        job.is_active = False
+        job.closed_at = job.closed_at or datetime.now(UTC)
+    elif job.is_active:
+        job.closed_at = None
+
+    session.commit()
+    session.refresh(job)
+    return job
 
 
 @router.post("/bulk-delete", response_model=BulkDeleteResponse)
@@ -239,10 +285,17 @@ def _save_and_score_job(session: Session, payload: dict) -> JobLead:
     profile_payload = get_profile_payload(profile)
     search_preferences = get_search_preferences(profile)
     job = upsert_job_lead(session, payload)
-    if profile_payload:
+    if profile_payload and profile is not None:
         ranking = rank_job(profile_payload, payload, search_preferences)
         job.score = ranking.score
         job.score_details = ranking.model_dump(mode="json")
+        default_search = sync_default_saved_search(session, profile, search_preferences)
+        upsert_saved_search_match(
+            session,
+            saved_search=default_search,
+            job=job,
+            profile_payload=profile_payload,
+        )
         session.commit()
         session.refresh(job)
     return job

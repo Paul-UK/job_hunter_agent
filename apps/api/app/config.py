@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     gemini_discovery_model: str = "gemini-3-flash-preview"
     gemini_discovery_timeout_seconds: float = 30.0
     gemini_discovery_max_attempts: int = 3
+    default_search_cadence_minutes: int = 1440
+    background_task_max_attempts: int = 3
+    orchestrator_poll_seconds: float = 5.0
 
     model_config = SettingsConfigDict(
         env_prefix="JOB_AGENT_",

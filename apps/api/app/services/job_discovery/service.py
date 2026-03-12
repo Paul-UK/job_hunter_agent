@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import re
 from typing import Any
@@ -93,6 +93,7 @@ class WebDiscoveryResult:
     search_queries: list[str]
     source_urls: list[str]
     grounded_pages_count: int
+    diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 class GeminiGroundedSearchClient:
@@ -213,6 +214,13 @@ def _discover_jobs_from_web_attempt(
         search_queries=search_result.search_queries,
         source_urls=source_urls,
         grounded_pages_count=len(fetched_urls),
+        diagnostics={
+            "candidate_count": len(search_result.candidates),
+            "accepted_job_count": len(jobs),
+            "rejected_pages_count": rejected_pages_count,
+            "fetched_url_count": len(fetched_urls),
+            "source_url_count": len(search_result.source_urls),
+        },
     )
 
 

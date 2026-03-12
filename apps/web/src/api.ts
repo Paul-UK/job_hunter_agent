@@ -1,12 +1,15 @@
 import type {
   ApplicationDraftResponse,
   ApplicationDraftAssistResponse,
+  BackgroundTaskResponse,
   BulkDeleteResponse,
   CandidateProfilePayload,
   CandidateProfileResponse,
   DashboardResponse,
   DeleteResponse,
   JobLeadResponse,
+  SavedSearchMatchResponse,
+  SavedSearchResponse,
   SearchPreferencesPayload,
   ScreeningAnswerPayload,
   WebJobDiscoveryResponse,
@@ -125,6 +128,64 @@ export function discoverWebJobs(search_preferences: SearchPreferencesPayload) {
   })
 }
 
+export function createSavedSearch(payload: {
+  name: string
+  search_preferences: SearchPreferencesPayload
+  enabled?: boolean
+  cadence_minutes?: number
+}) {
+  return request<SavedSearchResponse>('/api/searches', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: payload.name,
+      search_preferences: payload.search_preferences,
+      enabled: payload.enabled ?? true,
+      cadence_minutes: payload.cadence_minutes ?? 1440,
+    }),
+  })
+}
+
+export function updateSavedSearch(
+  searchId: number,
+  payload: {
+    name?: string
+    search_preferences?: SearchPreferencesPayload
+    enabled?: boolean
+    cadence_minutes?: number
+  },
+) {
+  return request<SavedSearchResponse>(`/api/searches/${searchId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deleteSavedSearch(searchId: number) {
+  return request<{ deleted_id: number }>(`/api/searches/${searchId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function runSavedSearch(searchId: number) {
+  return request<BackgroundTaskResponse>(`/api/searches/${searchId}/run`, {
+    method: 'POST',
+  })
+}
+
+export function saveSearchFeedback(
+  searchId: number,
+  jobId: number,
+  payload: { signal: 'neutral' | 'shortlisted' | 'dismissed' | 'drafted' | 'applied'; note?: string },
+) {
+  return request<SavedSearchMatchResponse>(`/api/searches/${searchId}/matches/${jobId}/feedback`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  })
+}
+
 export function captureLinkedinLead(payload: {
   company: string
   title: string
@@ -149,6 +210,23 @@ export function createDraft(jobId: number) {
 export function deleteJobLead(jobId: number) {
   return request<DeleteResponse>(`/api/jobs/${jobId}`, {
     method: 'DELETE',
+  })
+}
+
+export function updateJobCrm(
+  jobId: number,
+  payload: {
+    crm_stage?: 'new' | 'shortlisted' | 'drafted' | 'applied' | 'interviewing' | 'offer' | 'rejected' | 'archived'
+    crm_notes?: string | null
+    follow_up_at?: string | null
+    last_contacted_at?: string | null
+    is_active?: boolean
+  },
+) {
+  return request<JobLeadResponse>(`/api/jobs/${jobId}/crm`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   })
 }
 
@@ -203,6 +281,37 @@ export function runWorker(
       cover_note: payload.cover_note,
       screening_answers: payload.screening_answers,
     }),
+  })
+}
+
+export function queueWorkerRun(
+  applicationId: number,
+  payload: {
+    dry_run?: boolean
+    confirm_submit?: boolean
+    fixture_html?: string
+    answer_overrides?: WorkerAnswerOverride[]
+    cover_note?: string
+    screening_answers?: ScreeningAnswerPayload[]
+  } = {},
+) {
+  return request<BackgroundTaskResponse>(`/api/applications/${applicationId}/queue-run`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      dry_run: payload.dry_run ?? true,
+      confirm_submit: payload.confirm_submit ?? false,
+      fixture_html: payload.fixture_html,
+      answer_overrides: payload.answer_overrides ?? [],
+      cover_note: payload.cover_note,
+      screening_answers: payload.screening_answers,
+    }),
+  })
+}
+
+export function processBackgroundTasks(limit = 1) {
+  return request<{ processed: number }>(`/api/tasks/process?limit=${limit}`, {
+    method: 'POST',
   })
 }
 
