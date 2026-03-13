@@ -43,13 +43,40 @@ VALIDATION_ERROR_TEXT_PATTERNS = [
     re.compile(r"\bmust be selected\b", re.IGNORECASE),
     re.compile(r"\bcan't be blank\b", re.IGNORECASE),
 ]
-SCREENSHOT_CAPTURE_STATUSES = {"failed", "submit_failed", "submit_clicked", "submitted"}
+VERIFICATION_REQUIRED_TEXT_PATTERNS = [
+    re.compile(r"\bverification code\b", re.IGNORECASE),
+    re.compile(r"\bcheck your email\b", re.IGNORECASE),
+    re.compile(r"\bconfirm your email\b", re.IGNORECASE),
+    re.compile(r"\bverify your email\b", re.IGNORECASE),
+    re.compile(r"\benter (?:the )?code\b", re.IGNORECASE),
+    re.compile(r"\bone[- ]time code\b", re.IGNORECASE),
+    re.compile(r"\bsecurity code\b", re.IGNORECASE),
+]
+VERIFICATION_FOLLOW_UP_FIELD_PATTERNS = [
+    re.compile(r"\bverification\b", re.IGNORECASE),
+    re.compile(r"\bconfirmation\b", re.IGNORECASE),
+    re.compile(r"\bone[- ]?time\b", re.IGNORECASE),
+    re.compile(r"\bsecurity\b", re.IGNORECASE),
+    re.compile(r"\bpasscode\b", re.IGNORECASE),
+    re.compile(r"\botp\b", re.IGNORECASE),
+]
+VERIFICATION_REVIEW_REASON = (
+    "Verification code input appeared after submit. Enter the code from the ATS email checkpoint. "
+    "Retries still start a fresh browser session."
+)
+SCREENSHOT_CAPTURE_STATUSES = {
+    "failed",
+    "submit_failed",
+    "verification_required",
+    "submit_clicked",
+    "submitted",
+}
 
 
 @dataclass(frozen=True)
 class SubmissionConfirmationResult:
     confirmed: bool
-    outcome: Literal["confirmed", "invalid", "unconfirmed"]
+    outcome: Literal["confirmed", "invalid", "verification", "unconfirmed"]
     log: str
 
 
@@ -126,6 +153,19 @@ def run_worker(request: WorkerRunRequest) -> dict[str, Any]:
                             status = "submitted"
                         elif confirmation.outcome == "invalid":
                             status = "submit_failed"
+                        elif confirmation.outcome == "verification":
+                            status = "verification_required"
+                            verification_fields = _extract_post_submit_verification_fields(
+                                page,
+                                platform,
+                                llm_client,
+                                existing_fields=fields,
+                                logs=logs,
+                            )
+                            if verification_fields:
+                                fields = _merge_fields(fields, verification_fields)
+                                review_items = [field for field in fields if field.requires_review]
+                                preview_summary = build_preview_summary(fields)
                         else:
                             status = "submit_clicked"
                         logs.append(confirmation.log)
@@ -224,6 +264,146 @@ def _build_actions(page, platform: str, fields: list[WorkerFieldState], logs: li
             ).model_dump(mode="json")
         )
     return actions
+
+
+def _extract_post_submit_verification_fields(
+    page,
+    platform: str,
+    llm_client,
+    *,
+    existing_fields: list[WorkerFieldState],
+    logs: list[str],
+) -> list[WorkerFieldState]:
+    post_submit_fields = extract_form_fields(page)
+    existing_field_ids = {field.field_id for field in existing_fields}
+    surfaced_fields: list[WorkerFieldState] = []
+    seen_field_ids: set[str] = set()
+
+    if post_submit_fields:
+        logs.append(
+            f"Extracted {len(post_submit_fields)} visible field(s) from the post-submit verification step."
+        )
+        classified_fields = classify_fields(post_submit_fields, platform, llm_client)
+        for field in classified_fields:
+            if field.field_id in seen_field_ids:
+                continue
+            if not _should_surface_verification_field(field, existing_field_ids):
+                continue
+            surfaced_fields.append(_mark_field_for_verification_review(field))
+            seen_field_ids.add(field.field_id)
+
+    if surfaced_fields:
+        logs.append(f"Surfaced {len(surfaced_fields)} verification follow-up field(s).")
+        return surfaced_fields
+
+    prompt = _extract_verification_prompt(page)
+    if not prompt:
+        return []
+
+    logs.append("Surfaced a verification code prompt from the post-submit page.")
+    return [
+        WorkerFieldState(
+            field_id="post-submit-verification-code",
+            label="Verification code",
+            question_text=prompt,
+            selector="[data-post-submit-verification-code]",
+            field_type="text",
+            input_type="text",
+            required=True,
+            canonical_key="verification_code",
+            canonical_label="Verification code",
+            classification_confidence=1.0,
+            classification_source="post_submit",
+            classification_reasoning="Detected a verification checkpoint after submit.",
+            answer_value=None,
+            answer_source=None,
+            answer_confidence=0.0,
+            requires_review=True,
+            review_reason=VERIFICATION_REVIEW_REASON,
+        )
+    ]
+
+
+def _should_surface_verification_field(
+    field: WorkerFieldState, existing_field_ids: set[str]
+) -> bool:
+    if field.canonical_key == "verification_code" or _looks_like_verification_follow_up_field(field):
+        return True
+    return field.field_id not in existing_field_ids and field.required
+
+
+def _looks_like_verification_follow_up_field(field: WorkerFieldState) -> bool:
+    text = " ".join(
+        part
+        for part in [
+            field.label,
+            field.question_text,
+            field.placeholder,
+            field.html_name or "",
+            field.html_id or "",
+            field.canonical_label or "",
+        ]
+        if part
+    ).strip()
+    return bool(text) and _matches_any(VERIFICATION_FOLLOW_UP_FIELD_PATTERNS, text)
+
+
+def _mark_field_for_verification_review(field: WorkerFieldState) -> WorkerFieldState:
+    canonical_key = field.canonical_key or (
+        "verification_code" if _looks_like_verification_follow_up_field(field) else None
+    )
+    canonical_label = field.canonical_label or (
+        "Verification code" if canonical_key == "verification_code" else None
+    )
+    return field.model_copy(
+        update={
+            "canonical_key": canonical_key,
+            "canonical_label": canonical_label,
+            "answer_value": None,
+            "answer_source": None,
+            "answer_confidence": 0.0,
+            "requires_review": True,
+            "review_reason": VERIFICATION_REVIEW_REASON,
+            "classification_source": field.classification_source or "post_submit",
+            "classification_reasoning": field.classification_reasoning
+            or "Detected a verification checkpoint after submit.",
+        }
+    )
+
+
+def _extract_verification_prompt(page) -> str | None:
+    state = _read_post_submit_state(page)
+    combined_text = " ".join(
+        segment
+        for segment in [
+            str(state.get("alert_text") or "").strip(),
+            str(state.get("body_text") or "").strip(),
+        ]
+        if segment
+    ).strip()
+    if not combined_text or not _matches_any(VERIFICATION_REQUIRED_TEXT_PATTERNS, combined_text):
+        return None
+
+    for sentence in re.split(r"(?<=[.!?])\s+", combined_text):
+        normalized_sentence = sentence.strip()
+        if normalized_sentence and _matches_any(VERIFICATION_REQUIRED_TEXT_PATTERNS, normalized_sentence):
+            return normalized_sentence[:220]
+    return combined_text[:220]
+
+
+def _merge_fields(
+    existing_fields: list[WorkerFieldState], new_fields: list[WorkerFieldState]
+) -> list[WorkerFieldState]:
+    merged_fields = list(existing_fields)
+    index_by_field_id = {field.field_id: index for index, field in enumerate(merged_fields)}
+    for field in new_fields:
+        existing_index = index_by_field_id.get(field.field_id)
+        if existing_index is None:
+            index_by_field_id[field.field_id] = len(merged_fields)
+            merged_fields.append(field)
+        else:
+            merged_fields[existing_index] = field
+    return merged_fields
 
 
 def _apply_actions(page, actions: list[dict[str, Any]], logs: list[str]) -> list[str]:
@@ -342,7 +522,7 @@ def _autocomplete_option(page, locator, action: dict[str, Any]) -> bool:
 
     search_queries = [typed_value]
     if "," in typed_value:
-        search_queries.append(typed_value.split(",", 1)[0].strip())
+        search_queries = [typed_value.split(",", 1)[0].strip(), typed_value]
 
     for query in _dedupe_selectors(search_queries):
         try:
@@ -358,12 +538,7 @@ def _autocomplete_option(page, locator, action: dict[str, Any]) -> bool:
             except PlaywrightError:
                 continue
 
-        try:
-            page.wait_for_timeout(250)
-        except PlaywrightError:
-            pass
-
-        option_locator = _locate_choice_option(page, action)
+        option_locator = _wait_for_choice_option(page, action)
         if option_locator is not None:
             try:
                 option_locator.scroll_into_view_if_needed(timeout=2000)
@@ -372,15 +547,67 @@ def _autocomplete_option(page, locator, action: dict[str, Any]) -> bool:
 
             try:
                 option_locator.click()
-                return True
             except PlaywrightError:
                 continue
 
+            if _autocomplete_selection_committed(page, locator):
+                return True
+
+        try:
+            locator.press("ArrowDown")
+            locator.press("Enter")
+            page.wait_for_timeout(200)
+        except PlaywrightError:
+            continue
+
+        if _autocomplete_selection_committed(page, locator):
+            return True
+    return False
+
+
+def _wait_for_choice_option(page, action: dict[str, Any]):
+    for wait_ms in (200, 400, 800, 1200):
+        try:
+            page.wait_for_timeout(wait_ms)
+        except PlaywrightError:
+            return None
+        option_locator = _locate_choice_option(page, action)
+        if option_locator is not None:
+            return option_locator
+    return None
+
+
+def _autocomplete_selection_committed(page, locator) -> bool:
     try:
-        locator.press("ArrowDown")
-        locator.press("Enter")
         page.wait_for_timeout(150)
-        return True
+    except PlaywrightError:
+        return False
+
+    try:
+        return bool(
+            locator.evaluate(
+                """
+                (element) => {
+                  const input = element instanceof HTMLInputElement ? element : null
+                  const ariaInvalid = (element.getAttribute('aria-invalid') || '').toLowerCase()
+                  if (ariaInvalid === 'true') {
+                    return false
+                  }
+
+                  let current = element
+                  for (let depth = 0; depth < 5 && current; depth += 1) {
+                    const selectedValue = current.querySelector?.('.select__single-value')
+                    if (selectedValue && (selectedValue.textContent || '').trim()) {
+                      return true
+                    }
+                    current = current.parentElement
+                  }
+
+                  return Boolean(input && (input.value || '').trim())
+                }
+                """
+            )
+        )
     except PlaywrightError:
         return False
 
@@ -536,6 +763,13 @@ def _confirm_submission(page, initial_url: str) -> SubmissionConfirmationResult:
             log=f"Detected submission confirmation via redirect to {current_url}.",
         )
 
+    if _matches_any(VERIFICATION_REQUIRED_TEXT_PATTERNS, combined_text):
+        return SubmissionConfirmationResult(
+            confirmed=False,
+            outcome="verification",
+            log="Submit was clicked, and the ATS is asking for an email or verification code before final confirmation.",
+        )
+
     invalid_form_count = int(state["invalid_form_count"] or 0)
     invalid_field_count = int(state["invalid_field_count"] or 0)
     if invalid_form_count > 0 or invalid_field_count > 0:
@@ -561,6 +795,23 @@ def _confirm_submission(page, initial_url: str) -> SubmissionConfirmationResult:
             confirmed=False,
             outcome="invalid",
             log="Submit was clicked, but the resulting page still shows validation or error text.",
+        )
+
+    visible_form_count = int(state.get("visible_form_count") or 0)
+    visible_submit_count = int(state.get("visible_submit_count") or 0)
+
+    if (
+        normalized_current_url == normalized_initial_url
+        and visible_form_count > 0
+        and visible_submit_count > 0
+    ):
+        return SubmissionConfirmationResult(
+            confirmed=False,
+            outcome="verification",
+            log=(
+                "Submit was clicked, but the application form is still visible without validation errors. "
+                "A verification or follow-up confirmation step may be required."
+            ),
         )
 
     return SubmissionConfirmationResult(
@@ -601,6 +852,7 @@ def _read_post_submit_state(page) -> dict[str, Any]:
           }
 
           const forms = Array.from(document.forms)
+          const visibleFormCount = forms.filter((form) => isVisible(form)).length
           const invalidFormCount = forms.filter((form) => {
             try {
               return !form.checkValidity()
@@ -623,6 +875,10 @@ def _read_post_submit_state(page) -> dict[str, Any]:
             .map((element) => (element.textContent || '').trim())
             .filter(Boolean)
             .join(' ')
+
+          const visibleSubmitCount = Array.from(
+            document.querySelectorAll("button[type='submit'], input[type='submit']")
+          ).filter(isVisible).length
 
           const invalidFields = Array.from(
             document.querySelectorAll(
@@ -650,6 +906,8 @@ def _read_post_submit_state(page) -> dict[str, Any]:
             submitted_flag: document.body?.dataset?.submitted || '',
             body_text: (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 5000),
             alert_text: alertText.slice(0, 1000),
+            visible_form_count: visibleFormCount,
+            visible_submit_count: visibleSubmitCount,
             invalid_form_count: invalidFormCount,
             invalid_field_count: invalidFieldCount,
             invalid_fields: invalidFields.slice(0, 5),

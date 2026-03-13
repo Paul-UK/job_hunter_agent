@@ -232,7 +232,7 @@ function App() {
     }
     if (sectionId === 'worker-run-section' && lastWorkerRun?.id) {
       setCollapsedWorkerRunIds((current) =>
-        current[lastWorkerRun.id] ? { ...current, [lastWorkerRun.id]: false } : current,
+        (current[lastWorkerRun.id] ?? true) ? { ...current, [lastWorkerRun.id]: false } : current,
       )
     }
     return scrollToElement(document.getElementById(sectionId))
@@ -1148,7 +1148,7 @@ function App() {
     const linkedJob = application ? jobsById.get(application.job_lead_id) ?? null : null
     if (options.confirmSubmit && !options.retryAnyway && hasRecordedSubmission(application, linkedJob)) {
       updateStatus(
-        'A submission is already recorded for this application. Use Retry Anyway to force another debug attempt.',
+        'A submission or verification step is already recorded for this application. Use Retry Anyway to force another debug attempt.',
         {
         tone: 'warning',
         toast: true,
@@ -1340,7 +1340,7 @@ function App() {
   const autofillReadyFields = (lastWorkerRun?.fields ?? []).filter(
     (field) => field.answer_value && !field.requires_review,
   )
-  const isLastWorkerRunCollapsed = lastWorkerRun ? (collapsedWorkerRunIds[lastWorkerRun.id] ?? false) : false
+  const isLastWorkerRunCollapsed = lastWorkerRun ? (collapsedWorkerRunIds[lastWorkerRun.id] ?? true) : false
   const isLastWorkerRunPending = isPendingWorkerStatus(lastWorkerRun?.status)
 
   return (
@@ -2651,14 +2651,14 @@ function App() {
                   onClick={() =>
                     setCollapsedWorkerRunIds((current) => ({
                       ...current,
-                      [lastWorkerRun.id]: !current[lastWorkerRun.id],
+                      [lastWorkerRun.id]: !(current[lastWorkerRun.id] ?? true),
                     }))
                   }
                   onKeyDown={(event) =>
                     handleToggleHeaderKeyDown(event, () =>
                       setCollapsedWorkerRunIds((current) => ({
                         ...current,
-                        [lastWorkerRun.id]: !current[lastWorkerRun.id],
+                        [lastWorkerRun.id]: !(current[lastWorkerRun.id] ?? true),
                       })),
                     )
                   }
@@ -2783,7 +2783,18 @@ function App() {
 
                     {!isLastWorkerRunPending && lastWorkerRun.review_items.length > 0 ? (
                       <div className="worker-review-section">
-                        <h3>Review required</h3>
+                        <h3>
+                          {lastWorkerRun.status === 'verification_required'
+                            ? 'Verification required'
+                            : 'Review required'}
+                        </h3>
+                        {lastWorkerRun.status === 'verification_required' ? (
+                          <p className="muted">
+                            The ATS showed a follow-up code or email checkpoint after submit. The
+                            fields below were visible when the worker stopped. Re-running still
+                            starts a fresh browser session.
+                          </p>
+                        ) : null}
                         <div className="review-grid">
                           {lastWorkerRun.review_items.map((field) => (
                             <article key={field.field_id} className="review-card">
@@ -3138,11 +3149,16 @@ function getTrackedJobStatus(
 }
 
 function isTrackedApplicationStatus(status?: string | null) {
-  return status === 'submitted' || status === 'submit_clicked' || status === 'submit_failed'
+  return (
+    status === 'submitted' ||
+    status === 'submit_clicked' ||
+    status === 'submit_failed' ||
+    status === 'verification_required'
+  )
 }
 
 function isRecordedApplicationStatus(status?: string | null) {
-  return status === 'submitted' || status === 'submit_clicked'
+  return status === 'submitted' || status === 'submit_clicked' || status === 'verification_required'
 }
 
 function hasRecordedSubmission(
@@ -3221,6 +3237,9 @@ function formatWorkerStatus(status: string) {
   if (status === 'submit_failed') {
     return 'Submit failed'
   }
+  if (status === 'verification_required') {
+    return 'Verification required'
+  }
   if (status === 'submit_clicked') {
     return 'Submit clicked'
   }
@@ -3239,7 +3258,9 @@ function getWorkerStatusBadgeClassName(status?: string | null) {
       ? 'success'
       : status === 'failed' || status === 'submit_failed'
         ? 'error'
-        : status === 'submit_clicked' || status === 'awaiting_answers'
+        : status === 'submit_clicked' ||
+            status === 'awaiting_answers' ||
+            status === 'verification_required'
           ? 'warning'
           : status === 'queued' || status === 'running'
             ? 'info'
@@ -3276,6 +3297,9 @@ function formatFeedbackState(state: string) {
 
 function canAssistField(field: WorkerFieldState) {
   if (field.options.length > 0) {
+    return false
+  }
+  if (field.canonical_key === 'verification_code') {
     return false
   }
   return !['select', 'radio', 'checkbox', 'file'].includes(field.field_type)

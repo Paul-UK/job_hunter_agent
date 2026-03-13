@@ -10,6 +10,7 @@ CANONICAL_LABELS = {
     "last_name": "Last name",
     "full_name": "Full name",
     "email": "Email",
+    "verification_code": "Verification code",
     "phone": "Phone",
     "phone_country_code": "Phone country code",
     "location": "Location",
@@ -30,6 +31,18 @@ HEURISTIC_PATTERNS: list[tuple[str, tuple[str, ...], float]] = [
     ("first_name", (r"\bfirst name\b", r"\bgiven name\b"), 0.99),
     ("last_name", (r"\blast name\b", r"\bsurname\b", r"\bfamily name\b"), 0.99),
     ("full_name", (r"\bfull name\b", r"\byour name\b"), 0.96),
+    (
+        "verification_code",
+        (
+            r"\bverification code\b",
+            r"\bconfirmation code\b",
+            r"\bone[- ]?time(?: pass)?code\b",
+            r"\bsecurity code\b",
+            r"\bpasscode\b",
+            r"\botp\b",
+        ),
+        0.99,
+    ),
     ("email", (r"\be[- ]?mail\b",), 0.99),
     ("phone", (r"\bphone\b", r"\bmobile\b", r"\btelephone\b", r"\bcell\b"), 0.98),
     (

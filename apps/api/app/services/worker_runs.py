@@ -14,7 +14,7 @@ from apps.api.app.schemas import (
 from apps.api.app.services.saved_searches import apply_feedback_for_job
 from apps.api.app.services.storage import get_latest_profile, get_profile_payload
 
-RECORDED_SUBMISSION_STATUSES = {"submitted", "submit_clicked"}
+RECORDED_SUBMISSION_STATUSES = {"submitted", "submit_clicked", "verification_required"}
 
 
 class DuplicateSubmissionBlockedError(ValueError):
@@ -38,7 +38,7 @@ def build_worker_request(
 
     if payload.confirm_submit and not payload.retry_anyway and _has_recorded_submission_status(draft, job):
         raise DuplicateSubmissionBlockedError(
-            "A submission has already been recorded for this application. Duplicate submit is blocked unless retry_anyway is set."
+            "A submission or verification step has already been recorded for this application. Duplicate submit is blocked unless retry_anyway is set."
         )
 
     if payload.cover_note is not None:

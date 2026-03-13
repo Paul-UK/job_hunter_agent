@@ -64,11 +64,32 @@ def test_detect_platform_recognizes_ashbyhq_urls():
 def test_should_capture_screenshot_only_for_failures_and_submission_states():
     assert _should_capture_screenshot("failed") is True
     assert _should_capture_screenshot("submit_failed") is True
+    assert _should_capture_screenshot("verification_required") is True
     assert _should_capture_screenshot("submit_clicked") is True
     assert _should_capture_screenshot("submitted") is True
     assert _should_capture_screenshot("preview_ready") is False
     assert _should_capture_screenshot("awaiting_answers") is False
     assert _should_capture_screenshot("ready_for_submit") is False
+
+
+def test_classify_field_detects_verification_code_inputs():
+    field = WorkerFieldState(
+        field_id="verification_code",
+        label="Verification code",
+        question_text="Enter the verification code from your email",
+        selector="#verification_code",
+        field_type="text",
+        input_type="text",
+        html_name="verification_code",
+        html_id="verification_code",
+        required=True,
+    )
+
+    classified = classify_field(field, "greenhouse", FakeLLMClient())
+
+    assert classified.canonical_key == "verification_code"
+    assert classified.canonical_label == "Verification code"
+    assert classified.classification_source == "heuristic"
 
 
 def test_extract_form_fields_prefers_structural_selector_attributes():

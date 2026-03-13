@@ -256,7 +256,7 @@ def test_application_submit_routes_block_duplicate_submission(client):
         assert worker_run_count == []
 
 
-def test_application_submit_retry_anyway_bypasses_duplicate_block(client):
+def test_application_submit_retry_anyway_bypasses_verification_required_block(client):
     seed_profile(client)
     job_id = create_job(client)
     draft_response = client.post(f"/api/jobs/{job_id}/draft")
@@ -267,8 +267,8 @@ def test_application_submit_retry_anyway_bypasses_duplicate_block(client):
         draft = session.execute(
             select(ApplicationDraft).where(ApplicationDraft.id == draft_id)
         ).scalar_one()
-        draft.status = "submit_clicked"
-        draft.job_lead.status = "submit_clicked"
+        draft.status = "verification_required"
+        draft.job_lead.status = "verification_required"
         session.commit()
 
     queue_response = client.post(
