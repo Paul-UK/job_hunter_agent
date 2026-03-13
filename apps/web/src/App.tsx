@@ -2783,7 +2783,18 @@ function App() {
 
                     {!isLastWorkerRunPending && lastWorkerRun.review_items.length > 0 ? (
                       <div className="worker-review-section">
-                        <h3>Review required</h3>
+                        <h3>
+                          {lastWorkerRun.status === 'verification_required'
+                            ? 'Verification required'
+                            : 'Review required'}
+                        </h3>
+                        {lastWorkerRun.status === 'verification_required' ? (
+                          <p className="muted">
+                            The ATS showed a follow-up code or email checkpoint after submit. The
+                            fields below were visible when the worker stopped. Re-running still
+                            starts a fresh browser session.
+                          </p>
+                        ) : null}
                         <div className="review-grid">
                           {lastWorkerRun.review_items.map((field) => (
                             <article key={field.field_id} className="review-card">
@@ -3286,6 +3297,9 @@ function formatFeedbackState(state: string) {
 
 function canAssistField(field: WorkerFieldState) {
   if (field.options.length > 0) {
+    return false
+  }
+  if (field.canonical_key === 'verification_code') {
     return false
   }
   return !['select', 'radio', 'checkbox', 'file'].includes(field.field_type)

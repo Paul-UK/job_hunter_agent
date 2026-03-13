@@ -234,6 +234,14 @@ def test_worker_submit_with_verification_requirement_marks_verification_required
 
     assert worker_run["status"] == "verification_required"
     assert any("verification" in log.lower() for log in worker_run["logs"])
+    assert worker_run["review_items"]
+    assert any(
+        item["canonical_key"] == "verification_code"
+        or "verification" in (item["label"] or "").lower()
+        or "verification" in (item["question_text"] or "").lower()
+        for item in worker_run["review_items"]
+    )
+    assert worker_run["preview_summary"]["review_required_count"] >= 1
 
     with SessionLocal() as session:
         job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one()
@@ -692,7 +700,18 @@ def verification_required_greenhouse_submit_fixture_html() -> str:
             "const notice = document.createElement('div'); "
             "notice.id = 'verification-notice'; "
             "notice.textContent = 'Check your email for a verification code to continue.'; "
-            "document.body.prepend(notice);\">"
+            "const codeLabel = document.createElement('label'); "
+            "codeLabel.setAttribute('for', 'verification_code'); "
+            "codeLabel.textContent = 'Verification code'; "
+            "const codeInput = document.createElement('input'); "
+            "codeInput.id = 'verification_code'; "
+            "codeInput.name = 'verification_code'; "
+            "codeInput.required = true; "
+            "codeInput.setAttribute('autocomplete', 'one-time-code'); "
+            "const form = document.querySelector('form'); "
+            "form.appendChild(notice); "
+            "form.appendChild(codeLabel); "
+            "form.appendChild(codeInput);\">"
         ),
         1,
     )
