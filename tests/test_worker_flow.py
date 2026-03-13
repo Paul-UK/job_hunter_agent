@@ -203,6 +203,43 @@ def test_worker_submit_without_confirmation_marks_submit_clicked(client):
         assert job.status == "submit_clicked"
 
 
+def test_worker_submit_with_verification_requirement_marks_verification_required(client):
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/fixture-2b-verification",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": verification_required_greenhouse_submit_fixture_html(),
+            "answer_overrides": [
+                {"field_id": "question-work-auth", "value": "Yes"},
+                {
+                    "field_id": "question-why-anthropic",
+                    "value": "Anthropic sits at the intersection of AI quality, support, and real customer impact.",
+                },
+            ],
+        },
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "verification_required"
+    assert any("verification" in log.lower() for log in worker_run["logs"])
+
+    with SessionLocal() as session:
+        job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one()
+        assert job.status == "verification_required"
+
+
 def test_worker_submit_with_invalid_form_bounce_marks_submit_failed(client):
     seed_profile(client)
     job_id = create_job(
@@ -636,7 +673,27 @@ def unconfirmed_greenhouse_submit_fixture_html() -> str:
     base_fixture = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
     return base_fixture.replace(
         "<form>",
-        "<form onsubmit=\"event.preventDefault(); document.body.dataset.submitAttempted = 'true';\">",
+        (
+            "<form onsubmit=\"event.preventDefault(); "
+            "document.body.innerHTML = '<main><h1>We are processing your application</h1>"
+            "<p>Your submission is being reviewed.</p></main>'; "
+            "history.replaceState({}, '', '/applications/pending');\">"
+        ),
+        1,
+    )
+
+
+def verification_required_greenhouse_submit_fixture_html() -> str:
+    base_fixture = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
+    return base_fixture.replace(
+        "<form>",
+        (
+            "<form onsubmit=\"event.preventDefault(); "
+            "const notice = document.createElement('div'); "
+            "notice.id = 'verification-notice'; "
+            "notice.textContent = 'Check your email for a verification code to continue.'; "
+            "document.body.prepend(notice);\">"
+        ),
         1,
     )
 
@@ -739,30 +796,32 @@ def greenhouse_location_autocomplete_fixture_html() -> str:
               input.setAttribute('aria-expanded', 'false')
               return
             }
-
-            matches.forEach((option, index) => {
-              const node = document.createElement('div')
-              node.id = `react-select-candidate-location-option-${index}`
-              node.setAttribute('role', 'option')
-              node.textContent = option
-              node.addEventListener('click', () => {
-                window.__selectedLocation = option
-                input.value = ''
-                input.setAttribute('aria-invalid', 'false')
-                input.setAttribute('aria-expanded', 'false')
-                listbox.hidden = true
-                const existing = container.querySelector('.select__single-value')
-                if (existing) existing.remove()
-                const selected = document.createElement('div')
-                selected.className = 'select__single-value'
-                selected.textContent = option
-                container.prepend(selected)
+            window.clearTimeout(window.__locationRenderTimer || 0)
+            window.__locationRenderTimer = window.setTimeout(() => {
+              matches.forEach((option, index) => {
+                const node = document.createElement('div')
+                node.id = `react-select-candidate-location-option-${index}`
+                node.setAttribute('role', 'option')
+                node.textContent = option
+                node.addEventListener('click', () => {
+                  window.__selectedLocation = option
+                  input.value = ''
+                  input.setAttribute('aria-invalid', 'false')
+                  input.setAttribute('aria-expanded', 'false')
+                  listbox.hidden = true
+                  const existing = container.querySelector('.select__single-value')
+                  if (existing) existing.remove()
+                  const selected = document.createElement('div')
+                  selected.className = 'select__single-value'
+                  selected.textContent = option
+                  container.prepend(selected)
+                })
+                listbox.appendChild(node)
               })
-              listbox.appendChild(node)
-            })
 
-            listbox.hidden = false
-            input.setAttribute('aria-expanded', 'true')
+              listbox.hidden = false
+              input.setAttribute('aria-expanded', 'true')
+            }, 500)
           }
 
           input.addEventListener('input', (event) => {

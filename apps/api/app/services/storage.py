@@ -236,7 +236,12 @@ def upsert_job_lead(session: Session, payload: dict) -> JobLead:
             if (
                 field_name == "status"
                 and value == "discovered"
-                and existing.status in {"submitted", "submit_clicked", "submit_failed"}
+                and existing.status in {
+                    "submitted",
+                    "submit_clicked",
+                    "submit_failed",
+                    "verification_required",
+                }
             ):
                 continue
             setattr(existing, field_name, value)

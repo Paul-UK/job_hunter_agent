@@ -64,6 +64,7 @@ def test_detect_platform_recognizes_ashbyhq_urls():
 def test_should_capture_screenshot_only_for_failures_and_submission_states():
     assert _should_capture_screenshot("failed") is True
     assert _should_capture_screenshot("submit_failed") is True
+    assert _should_capture_screenshot("verification_required") is True
     assert _should_capture_screenshot("submit_clicked") is True
     assert _should_capture_screenshot("submitted") is True
     assert _should_capture_screenshot("preview_ready") is False

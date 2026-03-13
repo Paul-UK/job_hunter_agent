@@ -43,13 +43,28 @@ VALIDATION_ERROR_TEXT_PATTERNS = [
     re.compile(r"\bmust be selected\b", re.IGNORECASE),
     re.compile(r"\bcan't be blank\b", re.IGNORECASE),
 ]
-SCREENSHOT_CAPTURE_STATUSES = {"failed", "submit_failed", "submit_clicked", "submitted"}
+VERIFICATION_REQUIRED_TEXT_PATTERNS = [
+    re.compile(r"\bverification code\b", re.IGNORECASE),
+    re.compile(r"\bcheck your email\b", re.IGNORECASE),
+    re.compile(r"\bconfirm your email\b", re.IGNORECASE),
+    re.compile(r"\bverify your email\b", re.IGNORECASE),
+    re.compile(r"\benter (?:the )?code\b", re.IGNORECASE),
+    re.compile(r"\bone[- ]time code\b", re.IGNORECASE),
+    re.compile(r"\bsecurity code\b", re.IGNORECASE),
+]
+SCREENSHOT_CAPTURE_STATUSES = {
+    "failed",
+    "submit_failed",
+    "verification_required",
+    "submit_clicked",
+    "submitted",
+}
 
 
 @dataclass(frozen=True)
 class SubmissionConfirmationResult:
     confirmed: bool
-    outcome: Literal["confirmed", "invalid", "unconfirmed"]
+    outcome: Literal["confirmed", "invalid", "verification", "unconfirmed"]
     log: str
 
 
@@ -126,6 +141,8 @@ def run_worker(request: WorkerRunRequest) -> dict[str, Any]:
                             status = "submitted"
                         elif confirmation.outcome == "invalid":
                             status = "submit_failed"
+                        elif confirmation.outcome == "verification":
+                            status = "verification_required"
                         else:
                             status = "submit_clicked"
                         logs.append(confirmation.log)
@@ -342,7 +359,7 @@ def _autocomplete_option(page, locator, action: dict[str, Any]) -> bool:
 
     search_queries = [typed_value]
     if "," in typed_value:
-        search_queries.append(typed_value.split(",", 1)[0].strip())
+        search_queries = [typed_value.split(",", 1)[0].strip(), typed_value]
 
     for query in _dedupe_selectors(search_queries):
         try:
@@ -358,12 +375,7 @@ def _autocomplete_option(page, locator, action: dict[str, Any]) -> bool:
             except PlaywrightError:
                 continue
 
-        try:
-            page.wait_for_timeout(250)
-        except PlaywrightError:
-            pass
-
-        option_locator = _locate_choice_option(page, action)
+        option_locator = _wait_for_choice_option(page, action)
         if option_locator is not None:
             try:
                 option_locator.scroll_into_view_if_needed(timeout=2000)
@@ -372,15 +384,67 @@ def _autocomplete_option(page, locator, action: dict[str, Any]) -> bool:
 
             try:
                 option_locator.click()
-                return True
             except PlaywrightError:
                 continue
 
+            if _autocomplete_selection_committed(page, locator):
+                return True
+
+        try:
+            locator.press("ArrowDown")
+            locator.press("Enter")
+            page.wait_for_timeout(200)
+        except PlaywrightError:
+            continue
+
+        if _autocomplete_selection_committed(page, locator):
+            return True
+    return False
+
+
+def _wait_for_choice_option(page, action: dict[str, Any]):
+    for wait_ms in (200, 400, 800, 1200):
+        try:
+            page.wait_for_timeout(wait_ms)
+        except PlaywrightError:
+            return None
+        option_locator = _locate_choice_option(page, action)
+        if option_locator is not None:
+            return option_locator
+    return None
+
+
+def _autocomplete_selection_committed(page, locator) -> bool:
     try:
-        locator.press("ArrowDown")
-        locator.press("Enter")
         page.wait_for_timeout(150)
-        return True
+    except PlaywrightError:
+        return False
+
+    try:
+        return bool(
+            locator.evaluate(
+                """
+                (element) => {
+                  const input = element instanceof HTMLInputElement ? element : null
+                  const ariaInvalid = (element.getAttribute('aria-invalid') || '').toLowerCase()
+                  if (ariaInvalid === 'true') {
+                    return false
+                  }
+
+                  let current = element
+                  for (let depth = 0; depth < 5 && current; depth += 1) {
+                    const selectedValue = current.querySelector?.('.select__single-value')
+                    if (selectedValue && (selectedValue.textContent || '').trim()) {
+                      return true
+                    }
+                    current = current.parentElement
+                  }
+
+                  return Boolean(input && (input.value || '').trim())
+                }
+                """
+            )
+        )
     except PlaywrightError:
         return False
 
@@ -563,6 +627,29 @@ def _confirm_submission(page, initial_url: str) -> SubmissionConfirmationResult:
             log="Submit was clicked, but the resulting page still shows validation or error text.",
         )
 
+    visible_form_count = int(state.get("visible_form_count") or 0)
+    visible_submit_count = int(state.get("visible_submit_count") or 0)
+    if _matches_any(VERIFICATION_REQUIRED_TEXT_PATTERNS, combined_text):
+        return SubmissionConfirmationResult(
+            confirmed=False,
+            outcome="verification",
+            log="Submit was clicked, and the ATS is asking for an email or verification code before final confirmation.",
+        )
+
+    if (
+        normalized_current_url == normalized_initial_url
+        and visible_form_count > 0
+        and visible_submit_count > 0
+    ):
+        return SubmissionConfirmationResult(
+            confirmed=False,
+            outcome="verification",
+            log=(
+                "Submit was clicked, but the application form is still visible without validation errors. "
+                "A verification or follow-up confirmation step may be required."
+            ),
+        )
+
     return SubmissionConfirmationResult(
         confirmed=False,
         outcome="unconfirmed",
@@ -601,6 +688,7 @@ def _read_post_submit_state(page) -> dict[str, Any]:
           }
 
           const forms = Array.from(document.forms)
+          const visibleFormCount = forms.filter((form) => isVisible(form)).length
           const invalidFormCount = forms.filter((form) => {
             try {
               return !form.checkValidity()
@@ -623,6 +711,10 @@ def _read_post_submit_state(page) -> dict[str, Any]:
             .map((element) => (element.textContent || '').trim())
             .filter(Boolean)
             .join(' ')
+
+          const visibleSubmitCount = Array.from(
+            document.querySelectorAll("button[type='submit'], input[type='submit']")
+          ).filter(isVisible).length
 
           const invalidFields = Array.from(
             document.querySelectorAll(
@@ -650,6 +742,8 @@ def _read_post_submit_state(page) -> dict[str, Any]:
             submitted_flag: document.body?.dataset?.submitted || '',
             body_text: (document.body?.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 5000),
             alert_text: alertText.slice(0, 1000),
+            visible_form_count: visibleFormCount,
+            visible_submit_count: visibleSubmitCount,
             invalid_form_count: invalidFormCount,
             invalid_field_count: invalidFieldCount,
             invalid_fields: invalidFields.slice(0, 5),
