@@ -264,6 +264,7 @@ export function runWorker(
   payload: {
     dry_run?: boolean
     confirm_submit?: boolean
+    retry_anyway?: boolean
     fixture_html?: string
     answer_overrides?: WorkerAnswerOverride[]
     cover_note?: string
@@ -276,6 +277,7 @@ export function runWorker(
     body: JSON.stringify({
       dry_run: payload.dry_run ?? true,
       confirm_submit: payload.confirm_submit ?? false,
+      retry_anyway: payload.retry_anyway ?? false,
       fixture_html: payload.fixture_html,
       answer_overrides: payload.answer_overrides ?? [],
       cover_note: payload.cover_note,
@@ -289,6 +291,7 @@ export function queueWorkerRun(
   payload: {
     dry_run?: boolean
     confirm_submit?: boolean
+    retry_anyway?: boolean
     fixture_html?: string
     answer_overrides?: WorkerAnswerOverride[]
     cover_note?: string
@@ -301,6 +304,7 @@ export function queueWorkerRun(
     body: JSON.stringify({
       dry_run: payload.dry_run ?? true,
       confirm_submit: payload.confirm_submit ?? false,
+      retry_anyway: payload.retry_anyway ?? false,
       fixture_html: payload.fixture_html,
       answer_overrides: payload.answer_overrides ?? [],
       cover_note: payload.cover_note,

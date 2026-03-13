@@ -14,6 +14,12 @@ from apps.api.app.schemas import (
 from apps.api.app.services.saved_searches import apply_feedback_for_job
 from apps.api.app.services.storage import get_latest_profile, get_profile_payload
 
+RECORDED_SUBMISSION_STATUSES = {"submitted", "submit_clicked"}
+
+
+class DuplicateSubmissionBlockedError(ValueError):
+    pass
+
 
 def build_worker_request(
     session: Session,
@@ -29,6 +35,11 @@ def build_worker_request(
     job = draft.job_lead
     if job is None:
         raise ValueError("Application draft is missing a linked job lead.")
+
+    if payload.confirm_submit and not payload.retry_anyway and _has_recorded_submission_status(draft, job):
+        raise DuplicateSubmissionBlockedError(
+            "A submission has already been recorded for this application. Duplicate submit is blocked unless retry_anyway is set."
+        )
 
     if payload.cover_note is not None:
         draft.cover_note = payload.cover_note
@@ -118,10 +129,13 @@ def persist_worker_result(
     worker_run.screenshot_path = result["screenshot_path"]
 
     draft.status = result["status"]
-    if result["status"] in {"submitted", "submit_clicked"}:
-        job.status = result["status"]
-        if result["status"] == "submitted":
-            job.crm_stage = "applied"
-            job.last_contacted_at = datetime.now(UTC)
-            apply_feedback_for_job(session, job_id=job.id, signal="applied")
+    job.status = result["status"]
+    if result["status"] == "submitted":
+        job.crm_stage = "applied"
+        job.last_contacted_at = datetime.now(UTC)
+        apply_feedback_for_job(session, job_id=job.id, signal="applied")
     return worker_run
+
+
+def _has_recorded_submission_status(draft: ApplicationDraft, job: JobLead) -> bool:
+    return draft.status in RECORDED_SUBMISSION_STATUSES or job.status in RECORDED_SUBMISSION_STATUSES

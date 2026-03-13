@@ -20,6 +20,10 @@ def resolve_fields(
     resolved_fields: list[WorkerFieldState] = []
 
     for field in fields:
+        if field.field_type == "file":
+            resolved_fields.append(_resolve_file_field(field, known_answers))
+            continue
+
         field_value = override_lookup.get(field.field_id)
         if field_value:
             resolved_fields.append(
@@ -83,6 +87,61 @@ def resolve_fields(
         resolved_fields.append(field)
 
     return resolved_fields
+
+
+def _resolve_file_field(field: WorkerFieldState, known_answers: dict[str, str]) -> WorkerFieldState:
+    if field.canonical_key == "resume_path":
+        resume_path = known_answers.get("resume_path", "").strip()
+        if resume_path:
+            return field.model_copy(
+                update={
+                    "answer_value": resume_path,
+                    "answer_source": _answer_source("resume_path"),
+                    "answer_confidence": 0.96,
+                    "requires_review": False,
+                    "review_reason": None,
+                }
+            )
+        if field.required:
+            return field.model_copy(
+                update={
+                    "answer_value": None,
+                    "answer_source": None,
+                    "answer_confidence": 0.0,
+                    "requires_review": True,
+                    "review_reason": "Resume upload is required before submission.",
+                }
+            )
+        return field.model_copy(
+            update={
+                "answer_value": None,
+                "answer_source": None,
+                "answer_confidence": 0.0,
+                "requires_review": False,
+                "review_reason": None,
+            }
+        )
+
+    if field.required:
+        return field.model_copy(
+            update={
+                "answer_value": None,
+                "answer_source": None,
+                "answer_confidence": 0.0,
+                "requires_review": True,
+                "review_reason": "File upload requires manual review before submission.",
+            }
+        )
+
+    return field.model_copy(
+        update={
+            "answer_value": None,
+            "answer_source": None,
+            "answer_confidence": 0.0,
+            "requires_review": False,
+            "review_reason": None,
+        }
+    )
 
 
 def build_preview_summary(fields: list[WorkerFieldState]) -> WorkerPreviewSummary:

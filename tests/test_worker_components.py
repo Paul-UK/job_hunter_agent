@@ -63,6 +63,7 @@ def test_detect_platform_recognizes_ashbyhq_urls():
 
 def test_should_capture_screenshot_only_for_failures_and_submission_states():
     assert _should_capture_screenshot("failed") is True
+    assert _should_capture_screenshot("submit_failed") is True
     assert _should_capture_screenshot("submit_clicked") is True
     assert _should_capture_screenshot("submitted") is True
     assert _should_capture_screenshot("preview_ready") is False
@@ -377,6 +378,24 @@ def test_classify_field_detects_phone_country_code_combobox():
     assert classified.classification_confidence >= 0.9
 
 
+def test_classify_field_does_not_map_cover_letter_file_upload_to_cover_note():
+    field = WorkerFieldState(
+        field_id="cover-letter",
+        label="Cover Letter",
+        question_text="Upload a cover letter",
+        selector="#cover_letter",
+        field_type="file",
+        input_type="file",
+        html_name="cover_letter",
+        html_id="cover_letter",
+    )
+
+    classified = classify_field(field, "greenhouse", DisabledLLMClient())
+
+    assert classified.canonical_key is None
+    assert classified.classification_source == "unclassified"
+
+
 def test_resolve_fields_prefers_override_and_tracks_preview_summary():
     request = WorkerRunRequest(
         application_draft_id=1,
@@ -494,6 +513,54 @@ def test_resolve_fields_matches_phone_country_code_from_phone_and_location():
 
     assert resolved[0].answer_value == "United Kingdom +44"
     assert resolved[0].answer_source == "profile"
+    assert resolved[0].requires_review is False
+
+
+def test_resolve_fields_does_not_apply_cover_note_text_to_file_upload():
+    request = WorkerRunRequest(
+        application_draft_id=1,
+        target_url="https://example.com/jobs/1",
+        platform="greenhouse",
+        profile=CandidateProfilePayload(
+            full_name="Paul Example",
+            email="paul@example.com",
+            location="London, UK",
+            links={"resume_path": "/tmp/resume.txt"},
+        ),
+        job=JobLeadWorkerPayload(
+            source="greenhouse",
+            company="Example Company",
+            title="AI Support Engineer",
+            location="London, UK",
+            employment_type="Hybrid",
+            url="https://example.com/jobs/1",
+            description="Support AI applications.",
+            requirements=[],
+            metadata_json={},
+        ),
+        draft=ApplicationDraftWorkerPayload(
+            tailored_summary="Strong fit",
+            cover_note="I want to help teams ship reliable AI support experiences.",
+            resume_bullets=[],
+            screening_answers=[],
+        ),
+        answer_overrides=[],
+    )
+    field = WorkerFieldState(
+        field_id="cover-letter",
+        label="Cover Letter",
+        question_text="Upload a cover letter",
+        selector="#cover_letter",
+        field_type="file",
+        input_type="file",
+        canonical_key="cover_note",
+        required=False,
+    )
+
+    resolved = resolve_fields(request, [field], FakeLLMClient())
+
+    assert resolved[0].answer_value is None
+    assert resolved[0].answer_source is None
     assert resolved[0].requires_review is False
 
 
