@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from playwright.sync_api import Error as PlaywrightError
@@ -42,7 +43,14 @@ VALIDATION_ERROR_TEXT_PATTERNS = [
     re.compile(r"\bmust be selected\b", re.IGNORECASE),
     re.compile(r"\bcan't be blank\b", re.IGNORECASE),
 ]
-SCREENSHOT_CAPTURE_STATUSES = {"failed", "submit_clicked", "submitted"}
+SCREENSHOT_CAPTURE_STATUSES = {"failed", "submit_failed", "submit_clicked", "submitted"}
+
+
+@dataclass(frozen=True)
+class SubmissionConfirmationResult:
+    confirmed: bool
+    outcome: Literal["confirmed", "invalid", "unconfirmed"]
+    log: str
 
 
 def run_worker(request: WorkerRunRequest) -> dict[str, Any]:
@@ -110,12 +118,17 @@ def run_worker(request: WorkerRunRequest) -> dict[str, Any]:
                         pre_submit_url = page.url
                         page.locator(submit_selector).first.click()
                         logs.append(f"Clicked submit using {submit_selector}.")
-                        submission_confirmed, confirmation_log = _confirm_submission(
+                        confirmation = _confirm_submission(
                             page,
                             initial_url=pre_submit_url,
                         )
-                        status = "submitted" if submission_confirmed else "submit_clicked"
-                        logs.append(confirmation_log)
+                        if confirmation.confirmed:
+                            status = "submitted"
+                        elif confirmation.outcome == "invalid":
+                            status = "submit_failed"
+                        else:
+                            status = "submit_clicked"
+                        logs.append(confirmation.log)
                     else:
                         status = "ready_for_submit"
                         logs.append(
@@ -157,6 +170,12 @@ def _build_actions(page, platform: str, fields: list[WorkerFieldState], logs: li
     actions: list[dict[str, Any]] = []
     for field in fields:
         value = (field.answer_value or "").strip()
+        if field.field_type == "file" and field.canonical_key != "resume_path":
+            if value:
+                logs.append(
+                    f"Skipped unsupported file upload field '{field.label or field.field_id}'."
+                )
+            continue
         if not value or field.requires_review:
             continue
 
@@ -187,6 +206,9 @@ def _build_actions(page, platform: str, fields: list[WorkerFieldState], logs: li
         mode = "fill"
         if field.field_type == "select":
             mode = "select" if field.input_type == "select" else "choose"
+        elif _should_use_autocomplete(field):
+            mode = "autocomplete"
+        autocomplete_option_candidates = _react_select_option_candidates(field) if mode == "autocomplete" else []
         actions.append(
             WorkerActionPayload(
                 field=field.canonical_key or field.label or field.field_id,
@@ -196,7 +218,9 @@ def _build_actions(page, platform: str, fields: list[WorkerFieldState], logs: li
                 mode=mode,
                 option_label=option.label if option else value,
                 option_selector=option.selector if option else None,
-                option_selector_candidates=option.selector_candidates if option else [],
+                option_selector_candidates=(
+                    option.selector_candidates if option else autocomplete_option_candidates
+                ),
             ).model_dump(mode="json")
         )
     return actions
@@ -226,6 +250,13 @@ def _apply_actions(page, actions: list[dict[str, Any]], logs: list[str]) -> list
                 if not _choose_option(page, locator, action):
                     logs.append(
                         f"Could not choose '{action.get('option_label') or action['value']}' for field '{action['field']}'."
+                    )
+                    failed_actions.append(str(action["field"]))
+                    continue
+            elif action.get("mode") == "autocomplete":
+                if not _autocomplete_option(page, locator, action):
+                    logs.append(
+                        f"Could not autocomplete '{action.get('option_label') or action['value']}' for field '{action['field']}'."
                     )
                     failed_actions.append(str(action["field"]))
                     continue
@@ -304,6 +335,56 @@ def _choose_option(page, locator, action: dict[str, Any]) -> bool:
     return True
 
 
+def _autocomplete_option(page, locator, action: dict[str, Any]) -> bool:
+    typed_value = str(action.get("value") or "").strip()
+    if not typed_value:
+        return False
+
+    search_queries = [typed_value]
+    if "," in typed_value:
+        search_queries.append(typed_value.split(",", 1)[0].strip())
+
+    for query in _dedupe_selectors(search_queries):
+        try:
+            locator.click()
+        except PlaywrightError:
+            pass
+
+        try:
+            locator.fill(query)
+        except PlaywrightError:
+            try:
+                locator.type(query, delay=20)
+            except PlaywrightError:
+                continue
+
+        try:
+            page.wait_for_timeout(250)
+        except PlaywrightError:
+            pass
+
+        option_locator = _locate_choice_option(page, action)
+        if option_locator is not None:
+            try:
+                option_locator.scroll_into_view_if_needed(timeout=2000)
+            except PlaywrightError:
+                pass
+
+            try:
+                option_locator.click()
+                return True
+            except PlaywrightError:
+                continue
+
+    try:
+        locator.press("ArrowDown")
+        locator.press("Enter")
+        page.wait_for_timeout(150)
+        return True
+    except PlaywrightError:
+        return False
+
+
 def _locate_choice_option(page, action: dict[str, Any]):
     direct_selectors = _dedupe_selectors(
         [
@@ -332,6 +413,35 @@ def _locate_choice_option(page, action: dict[str, Any]):
         if selector:
             return page.locator(selector).first
     return None
+
+
+def _should_use_autocomplete(field: WorkerFieldState) -> bool:
+    if field.field_type != "text":
+        return False
+    if field.canonical_key != "location":
+        return False
+    target = " ".join(
+        part
+        for part in [
+            field.html_id or "",
+            field.html_name or "",
+            field.selector or "",
+            field.label or "",
+            field.question_text or "",
+        ]
+        if part
+    ).lower()
+    return "location" in target
+
+
+def _react_select_option_candidates(field: WorkerFieldState) -> list[str]:
+    html_id = (field.html_id or "").strip()
+    if not html_id:
+        return []
+    return [
+        f"#react-select-{html_id}-option-0",
+        f"[id^='react-select-{html_id}-option-']",
+    ]
 
 
 def _selector_exists(page, selector: str) -> bool:
@@ -389,7 +499,7 @@ def _should_capture_screenshot(status: str) -> bool:
     return status in SCREENSHOT_CAPTURE_STATUSES
 
 
-def _confirm_submission(page, initial_url: str) -> tuple[bool, str]:
+def _confirm_submission(page, initial_url: str) -> SubmissionConfirmationResult:
     _wait_for_post_submit(page)
     state = _read_post_submit_state(page)
     current_url = str(state["url"] or page.url or "")
@@ -402,33 +512,62 @@ def _confirm_submission(page, initial_url: str) -> tuple[bool, str]:
     normalized_initial_url = _normalize_url(initial_url)
 
     if submitted_flag in {"1", "true", "yes"}:
-        return True, "Detected submission confirmation via page submitted flag."
+        return SubmissionConfirmationResult(
+            confirmed=True,
+            outcome="confirmed",
+            log="Detected submission confirmation via page submitted flag.",
+        )
 
     if _matches_any(SUBMISSION_CONFIRMATION_TEXT_PATTERNS, combined_text):
-        return True, "Detected submission confirmation from the resulting page text."
+        return SubmissionConfirmationResult(
+            confirmed=True,
+            outcome="confirmed",
+            log="Detected submission confirmation from the resulting page text.",
+        )
 
     if (
         normalized_current_url
         and normalized_current_url != normalized_initial_url
         and _matches_any(SUBMISSION_CONFIRMATION_URL_PATTERNS, normalized_current_url)
     ):
-        return True, f"Detected submission confirmation via redirect to {current_url}."
+        return SubmissionConfirmationResult(
+            confirmed=True,
+            outcome="confirmed",
+            log=f"Detected submission confirmation via redirect to {current_url}.",
+        )
 
     invalid_form_count = int(state["invalid_form_count"] or 0)
     invalid_field_count = int(state["invalid_field_count"] or 0)
     if invalid_form_count > 0 or invalid_field_count > 0:
-        return (
-            False,
-            "Submit was clicked, but the form still appears invalid; ATS confirmation was not detected.",
+        invalid_field_names = [
+            str(item.get("label") or item.get("selector") or "").strip()
+            for item in (state.get("invalid_fields") or [])
+            if str(item.get("label") or item.get("selector") or "").strip()
+        ]
+        invalid_field_summary = ""
+        if invalid_field_names:
+            invalid_field_summary = f" Invalid fields: {', '.join(invalid_field_names[:3])}."
+        return SubmissionConfirmationResult(
+            confirmed=False,
+            outcome="invalid",
+            log=(
+                "Submit was clicked, but the form still appears invalid; ATS confirmation was not detected."
+                f"{invalid_field_summary}"
+            ),
         )
 
     if _matches_any(VALIDATION_ERROR_TEXT_PATTERNS, combined_text):
-        return (
-            False,
-            "Submit was clicked, but the resulting page still shows validation or error text.",
+        return SubmissionConfirmationResult(
+            confirmed=False,
+            outcome="invalid",
+            log="Submit was clicked, but the resulting page still shows validation or error text.",
         )
 
-    return False, "Submit was clicked, but ATS confirmation was not detected on the resulting page."
+    return SubmissionConfirmationResult(
+        confirmed=False,
+        outcome="unconfirmed",
+        log="Submit was clicked, but ATS confirmation was not detected on the resulting page.",
+    )
 
 
 def _wait_for_post_submit(page) -> None:
@@ -485,6 +624,27 @@ def _read_post_submit_state(page) -> dict[str, Any]:
             .filter(Boolean)
             .join(' ')
 
+          const invalidFields = Array.from(
+            document.querySelectorAll(
+              "input:invalid, textarea:invalid, select:invalid, [aria-invalid='true']"
+            )
+          )
+            .filter(isVisible)
+            .map((element) => {
+              const candidate = element
+              const labelText =
+                (candidate.labels && candidate.labels[0] ? candidate.labels[0].innerText : '') ||
+                (candidate.getAttribute('aria-label') || '') ||
+                (candidate.getAttribute('name') || '') ||
+                (candidate.getAttribute('id') || '')
+              return {
+                label: labelText.replace(/\\s+/g, ' ').trim(),
+                selector: candidate.getAttribute('id') ? `#${candidate.getAttribute('id')}` : '',
+                validation_message:
+                  'validationMessage' in candidate ? String(candidate.validationMessage || '').trim() : '',
+              }
+            })
+
           return {
             url: window.location.href,
             submitted_flag: document.body?.dataset?.submitted || '',
@@ -492,6 +652,7 @@ def _read_post_submit_state(page) -> dict[str, Any]:
             alert_text: alertText.slice(0, 1000),
             invalid_form_count: invalidFormCount,
             invalid_field_count: invalidFieldCount,
+            invalid_fields: invalidFields.slice(0, 5),
           }
         }
         """

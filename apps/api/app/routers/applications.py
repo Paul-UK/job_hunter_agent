@@ -35,6 +35,7 @@ from apps.api.app.services.storage import (
 from apps.api.app.services.worker_runs import (
     build_worker_request,
     create_worker_run_placeholder,
+    DuplicateSubmissionBlockedError,
     persist_worker_result,
 )
 from apps.worker.main import run_worker
@@ -178,6 +179,8 @@ def run_application(
         raise HTTPException(status_code=404, detail="Application draft not found.")
     try:
         worker_request, job = build_worker_request(session, draft=draft, payload=payload)
+    except DuplicateSubmissionBlockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -210,6 +213,8 @@ def queue_application_run(
 
     try:
         task, _worker_run = enqueue_worker_task(session, draft=draft, payload=payload)
+    except DuplicateSubmissionBlockedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.commit()

@@ -96,6 +96,27 @@ def classify_fields(
 
 
 def classify_field(field: WorkerFieldState, platform: str, llm_client: LLMClient) -> WorkerFieldState:
+    if field.field_type == "file":
+        file_classification = _classify_file_field(field)
+        if file_classification is not None:
+            canonical_key, confidence, reasoning = file_classification
+            return field.model_copy(
+                update={
+                    "canonical_key": canonical_key,
+                    "canonical_label": CANONICAL_LABELS.get(canonical_key),
+                    "classification_confidence": confidence,
+                    "classification_source": "heuristic",
+                    "classification_reasoning": reasoning,
+                }
+            )
+        return field.model_copy(
+            update={
+                "classification_confidence": 0.0,
+                "classification_source": "unclassified",
+                "classification_reasoning": "File upload did not match a supported resume input.",
+            }
+        )
+
     heuristic = _heuristic_classification(field)
     if heuristic is not None:
         canonical_key, confidence, reasoning = heuristic
@@ -161,9 +182,13 @@ def _heuristic_classification(field: WorkerFieldState) -> tuple[str, float, str]
         if any(re.search(pattern, text) for pattern in patterns):
             return canonical_key, confidence, f"Matched {canonical_key} heuristic."
 
-    if field.field_type == "file":
-        return "resume_path", 0.75, "Defaulted visible file input to resume upload."
+    return None
 
+
+def _classify_file_field(field: WorkerFieldState) -> tuple[str, float, str] | None:
+    text = _field_text(field, include_options=False)
+    if re.search(r"\bresume\b|\bcv\b", text):
+        return "resume_path", 0.97, "Matched resume upload heuristic."
     return None
 
 

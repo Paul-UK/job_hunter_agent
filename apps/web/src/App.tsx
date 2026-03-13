@@ -681,6 +681,7 @@ function App() {
     return (dashboard?.applications ?? []).find((application) => application.id === applicationId) ?? null
   }, [dashboard?.applications, lastWorkerRun?.application_draft_id])
   const currentRunJob = currentRunDraft ? jobsById.get(currentRunDraft.job_lead_id) ?? null : null
+  const isCurrentRunSubmissionRecorded = hasRecordedSubmission(currentRunDraft, currentRunJob)
   const statusNavItems = [
     {
       label: 'Saved searches',
@@ -1122,7 +1123,7 @@ function App() {
 
   async function handleWorker(
     applicationId: number,
-    options: { dryRun: boolean; confirmSubmit: boolean },
+    options: { dryRun: boolean; confirmSubmit: boolean; retryAnyway?: boolean },
   ) {
     const editor = draftEditors[applicationId] ?? createDraftEditorStateFromId(applicationId, dashboard)
     if (!editor) {
@@ -1142,20 +1143,37 @@ function App() {
       return
     }
 
+    const application =
+      (dashboard?.applications ?? []).find((draft) => draft.id === applicationId) ?? null
+    const linkedJob = application ? jobsById.get(application.job_lead_id) ?? null : null
+    if (options.confirmSubmit && !options.retryAnyway && hasRecordedSubmission(application, linkedJob)) {
+      updateStatus(
+        'A submission is already recorded for this application. Use Retry Anyway to force another debug attempt.',
+        {
+        tone: 'warning',
+        toast: true,
+        },
+      )
+      return
+    }
+
     const busyLabel = options.confirmSubmit ? `submit-${applicationId}` : `preview-${applicationId}`
     await runAction(busyLabel, async () => {
       await queueWorkerRun(applicationId, {
         dry_run: options.dryRun,
         confirm_submit: options.confirmSubmit,
+        retry_anyway: options.retryAnyway,
         cover_note: editor.cover_note,
         screening_answers: editor.screening_answers,
         answer_overrides: buildAnswerOverrides(applicationId, reviewOverrides),
       })
       return {
         message: options.confirmSubmit
-          ? 'Queued application submission in the background.'
+          ? options.retryAnyway
+            ? 'Queued retry-anyway submission attempt in the background.'
+            : 'Queued application submission in the background.'
           : 'Queued worker preview in the background.',
-        tone: 'success',
+        tone: options.retryAnyway ? 'warning' : 'success',
         toast: true,
       }
     })
@@ -2369,6 +2387,7 @@ function App() {
                     const draftEditor =
                       draftEditors[application.id] ?? createDraftEditorState(application)
                     const linkedJob = jobsById.get(application.job_lead_id)
+                    const isSubmissionRecorded = hasRecordedSubmission(application, linkedJob)
                     const latestRun = latestRunByApplicationId.get(application.id)
                     const isLatestRunPending = latestRun ? isPendingWorkerStatus(latestRun.status) : false
                     const previewKey = `preview-${application.id}`
@@ -2547,14 +2566,37 @@ function App() {
                                   confirmSubmit: true,
                                 })
                               }
-                              disabled={busyKey === submitKey || isLatestRunPending}
+                              disabled={busyKey === submitKey || isLatestRunPending || isSubmissionRecorded}
                             >
                               {busyKey === submitKey
                                 ? 'Submitting...'
                                 : isLatestRunPending
                                   ? 'Run In Progress...'
-                                  : 'Submit Application'}
+                                  : isSubmissionRecorded
+                                    ? 'Application Recorded'
+                                    : 'Submit Application'}
                             </button>
+                            {isSubmissionRecorded ? (
+                              <button
+                                type="button"
+                                className="button-secondary"
+                                title="Bypass the duplicate-submit safeguard for another debug attempt."
+                                onClick={() =>
+                                  void handleWorker(application.id, {
+                                    dryRun: false,
+                                    confirmSubmit: true,
+                                    retryAnyway: true,
+                                  })
+                                }
+                                disabled={busyKey === submitKey || isLatestRunPending}
+                              >
+                                {busyKey === submitKey
+                                  ? 'Retrying...'
+                                  : isLatestRunPending
+                                    ? 'Run In Progress...'
+                                    : 'Retry Anyway'}
+                              </button>
+                            ) : null}
                             <button
                               type="button"
                               className="button-danger"
@@ -2864,15 +2906,42 @@ function App() {
                             })
                           }
                           disabled={
-                            busyKey === `submit-${currentRunApplicationId}` || isLastWorkerRunPending
+                            busyKey === `submit-${currentRunApplicationId}` ||
+                            isLastWorkerRunPending ||
+                            isCurrentRunSubmissionRecorded
                           }
                         >
                           {busyKey === `submit-${currentRunApplicationId}`
                             ? 'Submitting...'
                             : isLastWorkerRunPending
                               ? 'Run In Progress...'
-                              : 'Submit With Approved Answers'}
+                              : isCurrentRunSubmissionRecorded
+                                ? 'Application Recorded'
+                                : 'Submit With Approved Answers'}
                         </button>
+                        {isCurrentRunSubmissionRecorded ? (
+                          <button
+                            type="button"
+                            className="button-secondary"
+                            title="Bypass the duplicate-submit safeguard for another debug attempt."
+                            onClick={() =>
+                              void handleWorker(currentRunApplicationId, {
+                                dryRun: false,
+                                confirmSubmit: true,
+                                retryAnyway: true,
+                              })
+                            }
+                            disabled={
+                              busyKey === `submit-${currentRunApplicationId}` || isLastWorkerRunPending
+                            }
+                          >
+                            {busyKey === `submit-${currentRunApplicationId}`
+                              ? 'Retrying...'
+                              : isLastWorkerRunPending
+                                ? 'Run In Progress...'
+                                : 'Retry Anyway'}
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           className="button-danger"
@@ -3065,11 +3134,22 @@ function getTrackedJobStatus(
   if (linkedApplication?.status) {
     return linkedApplication.status
   }
-  return isRecordedApplicationStatus(job.status) ? job.status : null
+  return isTrackedApplicationStatus(job.status) ? job.status : null
+}
+
+function isTrackedApplicationStatus(status?: string | null) {
+  return status === 'submitted' || status === 'submit_clicked' || status === 'submit_failed'
 }
 
 function isRecordedApplicationStatus(status?: string | null) {
   return status === 'submitted' || status === 'submit_clicked'
+}
+
+function hasRecordedSubmission(
+  application?: ApplicationDraftResponse | null,
+  job?: JobLeadResponse | null,
+) {
+  return isRecordedApplicationStatus(application?.status) || isRecordedApplicationStatus(job?.status)
 }
 
 function isPendingWorkerStatus(status?: string | null) {
@@ -3138,6 +3218,9 @@ function formatWorkerStatus(status: string) {
   if (status === 'ready_for_submit') {
     return 'Ready to submit'
   }
+  if (status === 'submit_failed') {
+    return 'Submit failed'
+  }
   if (status === 'submit_clicked') {
     return 'Submit clicked'
   }
@@ -3154,7 +3237,7 @@ function getWorkerStatusBadgeClassName(status?: string | null) {
   const tone =
     status === 'submitted'
       ? 'success'
-      : status === 'failed'
+      : status === 'failed' || status === 'submit_failed'
         ? 'error'
         : status === 'submit_clicked' || status === 'awaiting_answers'
           ? 'warning'

@@ -7,7 +7,15 @@ from sqlalchemy.orm import sessionmaker
 
 from apps.api.app import db as db_module
 from apps.api.app.db import SessionLocal
-from apps.api.app.models import BackgroundTask, DiscoveryRun, JobLead, SavedSearch, SavedSearchMatch, WorkerRun
+from apps.api.app.models import (
+    ApplicationDraft,
+    BackgroundTask,
+    DiscoveryRun,
+    JobLead,
+    SavedSearch,
+    SavedSearchMatch,
+    WorkerRun,
+)
 from apps.api.app.services.job_discovery.service import WebDiscoveryResult
 
 
@@ -208,6 +216,79 @@ def test_queue_worker_run_reuses_existing_active_task(client):
         assert len(worker_run_count) == 1
 
 
+def test_application_submit_routes_block_duplicate_submission(client):
+    seed_profile(client)
+    job_id = create_job(client)
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft_id = draft_response.json()["id"]
+
+    with SessionLocal() as session:
+        draft = session.execute(
+            select(ApplicationDraft).where(ApplicationDraft.id == draft_id)
+        ).scalar_one()
+        draft.status = "submitted"
+        draft.job_lead.status = "submitted"
+        session.commit()
+
+    queue_response = client.post(
+        f"/api/applications/{draft_id}/queue-run",
+        json={"dry_run": False, "confirm_submit": True},
+    )
+    assert queue_response.status_code == 409
+    assert "retry_anyway" in queue_response.json()["detail"]
+
+    run_response = client.post(
+        f"/api/applications/{draft_id}/run",
+        json={"dry_run": False, "confirm_submit": True},
+    )
+    assert run_response.status_code == 409
+    assert "retry_anyway" in run_response.json()["detail"]
+
+    with SessionLocal() as session:
+        task_count = session.execute(
+            select(BackgroundTask).where(BackgroundTask.application_draft_id == draft_id)
+        ).scalars().all()
+        worker_run_count = session.execute(
+            select(WorkerRun).where(WorkerRun.application_draft_id == draft_id)
+        ).scalars().all()
+        assert task_count == []
+        assert worker_run_count == []
+
+
+def test_application_submit_retry_anyway_bypasses_duplicate_block(client):
+    seed_profile(client)
+    job_id = create_job(client)
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft_id = draft_response.json()["id"]
+
+    with SessionLocal() as session:
+        draft = session.execute(
+            select(ApplicationDraft).where(ApplicationDraft.id == draft_id)
+        ).scalar_one()
+        draft.status = "submit_clicked"
+        draft.job_lead.status = "submit_clicked"
+        session.commit()
+
+    queue_response = client.post(
+        f"/api/applications/{draft_id}/queue-run",
+        json={"dry_run": False, "confirm_submit": True, "retry_anyway": True},
+    )
+    assert queue_response.status_code == 200
+    assert queue_response.json()["status"] == "queued"
+
+    with SessionLocal() as session:
+        task_count = session.execute(
+            select(BackgroundTask).where(BackgroundTask.application_draft_id == draft_id)
+        ).scalars().all()
+        worker_run_count = session.execute(
+            select(WorkerRun).where(WorkerRun.application_draft_id == draft_id)
+        ).scalars().all()
+        assert len(task_count) == 1
+        assert len(worker_run_count) == 1
+
+
 def test_job_crm_patch_updates_role_state(client):
     seed_profile(client)
     job_id = create_job(client)
@@ -313,7 +394,7 @@ def test_migrate_database_upgrades_legacy_sqlite_schema(tmp_path, monkeypatch):
             ) VALUES (
               1, 'greenhouse', 'legacy-1', 'Legacy Co', 'Legacy Role', 'London, UK', 'Full-time',
               'https://example.com/jobs/legacy-1', 'Legacy description', '[]', '{}', NULL, '{}', '{}',
-              'discovered', '2026-03-10 09:00:00', '2026-03-10 10:00:00'
+              'submit_clicked', '2026-03-10 09:00:00', '2026-03-10 10:00:00'
             )
             """
         )
@@ -349,6 +430,29 @@ def test_migrate_database_upgrades_legacy_sqlite_schema(tmp_path, monkeypatch):
             )
             """
         )
+        connection.exec_driver_sql(
+            """
+            INSERT INTO application_drafts (
+              id, profile_id, job_lead_id, tailored_summary, cover_note, resume_bullets,
+              screening_answers, status, created_at, updated_at
+            ) VALUES (
+              1, 1, 1, 'Legacy summary', 'Legacy cover note', '[]', '[]',
+              'submit_clicked', '2026-03-10 09:00:00', '2026-03-10 10:00:00'
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            INSERT INTO worker_runs (
+              id, application_draft_id, platform, target_url, dry_run, status, actions, logs,
+              screenshot_path, created_at
+            ) VALUES (
+              1, 1, 'greenhouse', 'https://example.com/jobs/legacy-1', 0, 'submit_clicked', '[]',
+              '["Clicked submit using button[type=''submit''].", "Submit was clicked, but the form still appears invalid; ATS confirmation was not detected."]',
+              NULL, '2026-03-10 10:00:00'
+            )
+            """
+        )
 
     monkeypatch.setattr(db_module, "engine", legacy_engine)
     monkeypatch.setattr(
@@ -374,8 +478,22 @@ def test_migrate_database_upgrades_legacy_sqlite_schema(tmp_path, monkeypatch):
     with legacy_engine.begin() as connection:
         upgraded_row = connection.exec_driver_sql(
             """
-            SELECT discovery_method, crm_stage, is_active, first_seen_at, last_seen_at, last_checked_at
+            SELECT discovery_method, crm_stage, is_active, first_seen_at, last_seen_at, last_checked_at, status
             FROM job_leads
+            WHERE id = 1
+            """
+        ).one()
+        upgraded_draft_row = connection.exec_driver_sql(
+            """
+            SELECT status
+            FROM application_drafts
+            WHERE id = 1
+            """
+        ).one()
+        upgraded_worker_run_row = connection.exec_driver_sql(
+            """
+            SELECT status
+            FROM worker_runs
             WHERE id = 1
             """
         ).one()
@@ -388,4 +506,7 @@ def test_migrate_database_upgrades_legacy_sqlite_schema(tmp_path, monkeypatch):
     assert upgraded_row[3] is not None
     assert upgraded_row[4] is not None
     assert upgraded_row[5] is not None
-    assert applied_versions == [(1,)]
+    assert upgraded_row[6] == "submit_failed"
+    assert upgraded_draft_row[0] == "submit_failed"
+    assert upgraded_worker_run_row[0] == "submit_failed"
+    assert applied_versions == [(1,), (2,)]

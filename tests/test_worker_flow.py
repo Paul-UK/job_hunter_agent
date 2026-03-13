@@ -203,6 +203,44 @@ def test_worker_submit_without_confirmation_marks_submit_clicked(client):
         assert job.status == "submit_clicked"
 
 
+def test_worker_submit_with_invalid_form_bounce_marks_submit_failed(client):
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/fixture-2c",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": invalid_greenhouse_submit_fixture_html(),
+            "answer_overrides": [
+                {"field_id": "question-work-auth", "value": "Yes"},
+                {
+                    "field_id": "question-why-anthropic",
+                    "value": "Anthropic sits at the intersection of AI quality, support, and real customer impact.",
+                },
+            ],
+        },
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "submit_failed"
+    assert any("clicked submit" in log.lower() for log in worker_run["logs"])
+    assert any("form still appears invalid" in log.lower() for log in worker_run["logs"])
+
+    with SessionLocal() as session:
+        job = session.execute(select(JobLead).where(JobLead.id == job_id)).scalar_one()
+        assert job.status == "submit_failed"
+
+
 def test_worker_preview_handles_lever_form_and_flags_missing_answers(client, monkeypatch):
     monkeypatch.setattr("apps.worker.main.get_llm_client", lambda: FakeLLMClient())
     seed_profile(client)
@@ -284,6 +322,32 @@ def test_worker_submit_handles_custom_choice_widgets(client):
     assert worker_run["status"] == "submitted"
     assert any(action["mode"] == "choose" for action in worker_run["actions"])
     assert any(action["mode"] == "click" for action in worker_run["actions"])
+
+
+def test_worker_submit_handles_greenhouse_location_autocomplete(client):
+    seed_profile(client)
+    job_id = create_job(
+        source="greenhouse",
+        url="https://boards.greenhouse.io/example-company/jobs/location-autocomplete-fixture",
+    )
+
+    draft_response = client.post(f"/api/jobs/{job_id}/draft")
+    assert draft_response.status_code == 200
+    draft = draft_response.json()
+
+    worker_response = client.post(
+        f"/api/applications/{draft['id']}/run",
+        json={
+            "dry_run": False,
+            "confirm_submit": True,
+            "fixture_html": greenhouse_location_autocomplete_fixture_html(),
+        },
+    )
+    assert worker_response.status_code == 200
+    worker_run = worker_response.json()
+
+    assert worker_run["status"] == "submitted"
+    assert any(action["field"] == "location" and action["mode"] == "autocomplete" for action in worker_run["actions"])
 
 
 def test_worker_submit_handles_hidden_native_radio_fieldset(client, monkeypatch):
@@ -575,6 +639,140 @@ def unconfirmed_greenhouse_submit_fixture_html() -> str:
         "<form onsubmit=\"event.preventDefault(); document.body.dataset.submitAttempted = 'true';\">",
         1,
     )
+
+
+def invalid_greenhouse_submit_fixture_html() -> str:
+    base_fixture = (Path(__file__).parent / "fixtures" / "greenhouse_form.html").read_text()
+    return base_fixture.replace(
+        "<form>",
+        (
+            "<form onsubmit=\"event.preventDefault(); "
+            "const error = document.createElement('div'); "
+            "error.id = 'validation-error'; "
+            "error.setAttribute('role', 'alert'); "
+            "error.setAttribute('aria-invalid', 'true'); "
+            "error.textContent = 'Please complete the required fields.'; "
+            "document.body.appendChild(error);\">"
+        ),
+        1,
+    )
+
+
+def greenhouse_location_autocomplete_fixture_html() -> str:
+    return """
+    <html>
+      <body>
+        <form
+          onsubmit="
+            event.preventDefault();
+            const selected = window.__selectedLocation || '';
+            const input = document.getElementById('candidate-location');
+            const error = document.getElementById('candidate-location-error');
+            if (!selected) {
+              input.setAttribute('aria-invalid', 'true');
+              error.textContent = 'Please select a location from the list.';
+              return;
+            }
+            document.body.dataset.submitted = 'true';
+            document.body.innerHTML = '<main><h1>Thank you for applying</h1><p>Your application has been submitted.</p></main>';
+          "
+        >
+          <label for="first_name">First Name*</label>
+          <input id="first_name" name="first_name" required />
+
+          <label for="last_name">Last Name*</label>
+          <input id="last_name" name="last_name" required />
+
+          <label for="email">Email*</label>
+          <input id="email" name="email" type="email" required />
+
+          <label id="candidate-location-label" for="candidate-location">Location (City)*</label>
+          <div class="select__control">
+            <div class="select__value-container" id="candidate-location-container">
+              <input
+                id="candidate-location"
+                class="select__input"
+                type="text"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded="false"
+                aria-haspopup="true"
+                aria-invalid="false"
+                aria-labelledby="candidate-location-label"
+                aria-errormessage="candidate-location-error"
+                aria-describedby="candidate-location-error"
+                aria-required="true"
+                autocomplete="off"
+              />
+            </div>
+          </div>
+          <div id="candidate-location-error" role="alert"></div>
+
+          <div id="react-select-candidate-location-listbox" role="listbox" hidden></div>
+
+          <button type="submit">Submit Application</button>
+        </form>
+
+        <script>
+          window.__selectedLocation = ''
+          const input = document.getElementById('candidate-location')
+          const listbox = document.getElementById('react-select-candidate-location-listbox')
+          const container = document.getElementById('candidate-location-container')
+          const options = [
+            'London, England, United Kingdom',
+            'London, Ontario, Canada',
+            'New London, Connecticut, United States',
+          ]
+
+          const renderOptions = (query) => {
+            const normalized = (query || '').trim().toLowerCase()
+            listbox.innerHTML = ''
+            if (!normalized) {
+              listbox.hidden = true
+              input.setAttribute('aria-expanded', 'false')
+              return
+            }
+
+            const matches = options.filter((option) => option.toLowerCase().includes(normalized))
+            if (!matches.length) {
+              listbox.hidden = true
+              input.setAttribute('aria-expanded', 'false')
+              return
+            }
+
+            matches.forEach((option, index) => {
+              const node = document.createElement('div')
+              node.id = `react-select-candidate-location-option-${index}`
+              node.setAttribute('role', 'option')
+              node.textContent = option
+              node.addEventListener('click', () => {
+                window.__selectedLocation = option
+                input.value = ''
+                input.setAttribute('aria-invalid', 'false')
+                input.setAttribute('aria-expanded', 'false')
+                listbox.hidden = true
+                const existing = container.querySelector('.select__single-value')
+                if (existing) existing.remove()
+                const selected = document.createElement('div')
+                selected.className = 'select__single-value'
+                selected.textContent = option
+                container.prepend(selected)
+              })
+              listbox.appendChild(node)
+            })
+
+            listbox.hidden = false
+            input.setAttribute('aria-expanded', 'true')
+          }
+
+          input.addEventListener('input', (event) => {
+            window.__selectedLocation = ''
+            renderOptions(event.target.value)
+          })
+        </script>
+      </body>
+    </html>
+    """
 
 
 def react_select_fixture_html() -> str:

@@ -167,10 +167,59 @@ def _backfill_platform_upgrade_foundations(connection: Connection) -> None:
         )
 
 
+def _apply_submission_status_statefulness(connection: Connection) -> None:
+    inspector = inspect(connection)
+    existing_tables = set(inspector.get_table_names())
+    required_tables = {"worker_runs", "application_drafts", "job_leads"}
+    if not required_tables.issubset(existing_tables):
+        return
+
+    connection.exec_driver_sql(
+        """
+        UPDATE worker_runs
+        SET status = 'submit_failed'
+        WHERE status = 'submit_clicked'
+          AND logs LIKE '%form still appears invalid%'
+        """
+    )
+
+    connection.exec_driver_sql(
+        """
+        UPDATE application_drafts
+        SET status = 'submit_failed'
+        WHERE status = 'submit_clicked'
+          AND id IN (
+            SELECT DISTINCT application_draft_id
+            FROM worker_runs
+            WHERE status = 'submit_failed'
+              AND application_draft_id IS NOT NULL
+          )
+        """
+    )
+
+    connection.exec_driver_sql(
+        """
+        UPDATE job_leads
+        SET status = 'submit_failed'
+        WHERE status = 'submit_clicked'
+          AND id IN (
+            SELECT DISTINCT job_lead_id
+            FROM application_drafts
+            WHERE status = 'submit_failed'
+          )
+        """
+    )
+
+
 MIGRATION_REVISIONS = (
     MigrationRevision(
         version=1,
         name="platform_upgrade_foundations",
         apply=_apply_platform_upgrade_foundations,
+    ),
+    MigrationRevision(
+        version=2,
+        name="submission_status_statefulness",
+        apply=_apply_submission_status_statefulness,
     ),
 )

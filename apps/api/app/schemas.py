@@ -409,6 +409,7 @@ class WorkerRunRequest(BaseModel):
 class ApplicationRunRequest(BaseModel):
     dry_run: bool = True
     confirm_submit: bool = False
+    retry_anyway: bool = False
     fixture_html: str | None = None
     answer_overrides: list[WorkerAnswerOverride] = Field(default_factory=list)
     cover_note: str | None = None
